@@ -1,0 +1,5 @@
+curl -L -X POST 'https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/process-bounced-leads' \
+  -H 'Authorization: Bearer sb_publishable_LF_bXGV9UzxkapJIKVEczw_4o0cN4Ch' \
+  -H 'apikey: sb_publishable_LF_bXGV9UzxkapJIKVEczw_4o0cN4Ch' \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"Functions"}'

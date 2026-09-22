@@ -11,8 +11,10 @@ outbound follow-up label and, **only once a lead replies**, moves the whole thre
   `status_update_date` (Sydney local time) in `public.follow_up_sequence_threads` (MAGTestProject),
   matched on `thread_id`.
 - **Bounce handling:** bounced leads are **not** in `follow_up_sequence_threads`. On a bounce, the
-  script instead calls the `process_bounced_lead(_email_add_sent)` RPC with the bounced recipient's
-  email, then moves the thread to `follow-up-sequence-closed`.
+  script (1) calls the `process_bounced_lead(_email_add_sent)` RPC with the bounced recipient's email
+  to **record** the bounce, (2) invokes the **`process-bounced-leads` Edge Function** to push the
+  recorded bounces to ActiveCampaign (adds a deal note, then marks the deal Lost), then (3) moves the
+  thread to `follow-up-sequence-closed`.
 
 ## How it decides to move a thread
 
@@ -22,7 +24,7 @@ who sent it:
 | Event | Latest message | Result |
 |-------|----------------|--------|
 | James sends the first outbound / a follow-up | James (our domain) | **Stays** in `follow-up-sequence-soc-med` |
-| **Delivery failed / blocked** | postmaster or Mail Delivery Subsystem, saying *"Delivery has failed"* or *"Message blocked"* | Calls `process_bounced_lead(<bounced email>)`, then **moves** to `follow-up-sequence-closed` |
+| **Delivery failed / blocked** | postmaster or Mail Delivery Subsystem, saying *"Delivery has failed"* or *"Message blocked"* | Calls `process_bounced_lead(<bounced email>)`, invokes the `process-bounced-leads` Edge Function, then **moves** to `follow-up-sequence-closed` |
 | **Lead replies** | the lead (external, not a bounce/system sender) | **Moves** to `@-sales-to-action-outbound-lead-responses`, status → `8A` |
 | Auto-reply / out-of-office from the lead | the lead (external) | Moves as a reply (counts as a response — see notes) |
 
@@ -31,8 +33,8 @@ mistaken for anything else.
 
 - **Cost:** $0. Apps Script time triggers and Gmail usage are free.
 - **No OAuth client, refresh tokens, or Pub/Sub.** Auth is the standard Apps Script consent screen,
-  shown once when James runs the script. The Supabase update uses a service_role key stored in Script
-  Properties (see setup) — no edge function.
+  shown once when James runs the script. The Supabase REST/RPC calls and the `process-bounced-leads`
+  Edge Function invocation all use a service_role key stored in Script Properties (see setup).
 - **Consistency:** the Supabase update runs **before** the label move, so a transient Supabase error
   leaves the thread in the source label to retry next sweep rather than moving it out of sync.
 - **Idempotent:** once moved, the source label is removed, so the thread isn't reprocessed. Later
@@ -84,7 +86,8 @@ James, have James do these steps or do them while signed in to his account.
    Subsystem failure into a source-labelled thread as its latest message) → within ~1 minute confirm
    the thread moves to `follow-up-sequence-closed` and that `process_bounced_lead` was called with the
    bounced address (check the Executions log line `Called process_bounced_lead for bounced lead <email>`
-   and/or the effect of that function in your data).
+   and/or the effect of that function in your data). The next log line, `Invoked process-bounced-leads
+   Edge Function: ...`, confirms the ActiveCampaign push ran (deal note added + deal marked Lost).
 5. Check **Executions** (left sidebar) for run logs, e.g. `... moved 1 ... bounced 1 ...`, plus any
    `Supabase: no row found ...` warnings (a lead-reply thread wasn't tracked — it's still moved).
 
@@ -103,7 +106,8 @@ James, have James do these steps or do them while signed in to his account.
 | `SUPABASE_URL` | `https://aivitcomiywiysrfwqxt.supabase.co` | MAGTestProject REST endpoint. |
 | `SUPABASE_TABLE` | `follow_up_sequence_threads` | Table updated on transfer. |
 | `REPLIED_STATUS` | `8A` | Status set on the thread's row when the lead replies. |
-| `BOUNCE_RPC` / `BOUNCE_RPC_ARG` | `process_bounced_lead` / `_email_add_sent` | RPC called on a bounce, and its argument name. |
+| `BOUNCE_RPC` / `BOUNCE_RPC_ARG` | `process_bounced_lead` / `_email_add_sent` | RPC called on a bounce (records it), and its argument name. |
+| `BOUNCE_EDGE_FUNCTION` | `process-bounced-leads` | Edge Function invoked after the RPC to push recorded bounces to ActiveCampaign. |
 | `STATUS_DATE_TIMEZONE` | `Australia/Sydney` | Timezone used to stamp `status_update_date`. |
 | `SUPABASE_KEY_PROPERTY` | `SUPABASE_SERVICE_ROLE_KEY` | Script Property name holding the service_role key. |
 
@@ -124,9 +128,16 @@ label displays as `follow-up-sequence-soc-med` or `Follow Up Sequence Soc Med`.
 - **Bounces / blocks** are detected on the latest message from postmaster or Mail Delivery Subsystem
   whose subject/body contains *"Delivery has failed"* or *"Message blocked"*. The bounced recipient's
   email is taken from the address our outbound message(s) in that thread were sent to, then
-  `process_bounced_lead(<email>)` is called and the thread is moved to `follow-up-sequence-closed`.
+  `process_bounced_lead(<email>)` is called to record it, the `process-bounced-leads` Edge Function is
+  invoked to push it to ActiveCampaign, and finally the thread is moved to `follow-up-sequence-closed`.
   Other automated notices (e.g. "delayed") are ignored and the thread stays. If your provider phrases
   failures differently, add the phrase to `isBounceOrBlocked_`.
+- **Edge Function step:** `process-bounced-leads` takes no arguments — it processes **every** pending
+  row in `public.bounced_leads` (adds a deal note, marks the deal Lost) and is idempotent, so invoking
+  it once per bounce is safe. It's called **after** the RPC and **before** the label move, so a failure
+  (e.g. ActiveCampaign or the function being down) leaves the thread in the source label and both steps
+  retry on the next sweep. It authenticates with the same service_role key from Script Properties
+  (`SUPABASE_SERVICE_ROLE_KEY`), which also serves as the `apikey` the Functions gateway requires.
 - **Bounce = RPC only, no table row:** the bounce path never touches `follow_up_sequence_threads`. If
   the bounced recipient can't be determined from the thread, the thread is left in place and a warning
   is logged. The RPC is called **before** the label move, so a transient failure retries next sweep —

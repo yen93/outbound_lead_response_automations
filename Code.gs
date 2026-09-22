@@ -15,8 +15,10 @@
  *   - Lead reply  → set follow_up_sequence_threads.status = REPLIED_STATUS on the
  *                   row matched by thread_id, and stamp status_update_date.
  *   - Bounce/block → call the process_bounced_lead(_email_add_sent) RPC with the
- *                    bounced recipient's email (bounced leads are NOT in that table),
- *                    then move the thread to CLOSED_LABEL_TOKEN.
+ *                    bounced recipient's email (bounced leads are NOT in that table)
+ *                    to record it, then invoke the process-bounced-leads Edge
+ *                    Function to push those bounced leads to ActiveCampaign (deal
+ *                    note + mark Lost), then move the thread to CLOSED_LABEL_TOKEN.
  *   Bounce detection: latest message from postmaster / Mail Delivery Subsystem
  *   saying "Delivery has failed" or "Message blocked".
  *
@@ -81,6 +83,14 @@ const REPLIED_STATUS = '8A';
 /** Postgres function (PostgREST RPC) to call for a bounced/blocked send, and its argument name. */
 const BOUNCE_RPC = 'process_bounced_lead';
 const BOUNCE_RPC_ARG = '_email_add_sent';
+
+/**
+ * Supabase Edge Function (Functions endpoint) that processes the recorded bounced
+ * leads against ActiveCampaign (adds a deal note, then marks the deal Lost). Called
+ * after the RPC records a bounce. Takes no arguments — it acts on every pending row
+ * in public.bounced_leads and is idempotent — so it's safe to invoke per bounce.
+ */
+const BOUNCE_EDGE_FUNCTION = 'process-bounced-leads';
 
 /** Name of the Script Property that holds the Supabase service_role key (never hardcode the key). */
 const SUPABASE_KEY_PROPERTY = 'SUPABASE_SERVICE_ROLE_KEY';
@@ -180,8 +190,15 @@ function processRepliedThreads_(windowMinutes) {
                        ' but could not determine the bounced recipient; leaving in place.');
           continue;
         }
-        // RPC first: if it fails, leave the thread in source to retry next sweep.
+        // RPC first (records the bounce): if it fails, leave the thread in source
+        // to retry next sweep.
         if (!processBouncedLead_(bouncedEmail)) {
+          continue;
+        }
+        // Then push the recorded bounce(s) to ActiveCampaign via the Edge Function.
+        // Same retry philosophy: on failure, leave the thread in place so the next
+        // sweep re-runs both steps (both are idempotent).
+        if (!invokeProcessBouncedLeadsFunction_()) {
           continue;
         }
         if (moveLabels_(thread, closed, source)) {
@@ -462,6 +479,55 @@ function processBouncedLead_(email) {
     return false;
   } catch (err) {
     console.error('Supabase RPC ' + BOUNCE_RPC + ' error for ' + email + ': ' + err);
+    return false;
+  }
+}
+
+/**
+ * Invoke the process-bounced-leads Supabase Edge Function, which processes every
+ * pending row in public.bounced_leads against ActiveCampaign (adds a deal note,
+ * then marks the deal Lost). The function takes no arguments — it acts on all
+ * unprocessed rows and is idempotent — so it's safe to call once per bounce.
+ *
+ * Uses the same service_role key from Script Properties as the REST/RPC calls; it
+ * doubles as the apikey the Functions gateway requires (the function itself has
+ * verify_jwt disabled).
+ *
+ * @return {boolean} true on HTTP 2xx; false on a missing key, non-2xx, or thrown error.
+ */
+function invokeProcessBouncedLeadsFunction_() {
+  const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
+  if (!key) {
+    console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
+                  '"; cannot invoke the ' + BOUNCE_EDGE_FUNCTION + ' Edge Function.');
+    return false;
+  }
+
+  const url = SUPABASE_URL + '/functions/v1/' + BOUNCE_EDGE_FUNCTION;
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: key,
+      Authorization: 'Bearer ' + key
+    },
+    payload: JSON.stringify({}),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const resp = UrlFetchApp.fetch(url, options);
+    const code = resp.getResponseCode();
+    if (code >= 200 && code < 300) {
+      console.log('Invoked ' + BOUNCE_EDGE_FUNCTION + ' Edge Function: ' + resp.getContentText());
+      return true;
+    }
+    console.error('Edge Function ' + BOUNCE_EDGE_FUNCTION + ' failed (HTTP ' + code + '): ' +
+                  resp.getContentText());
+    return false;
+  } catch (err) {
+    console.error('Edge Function ' + BOUNCE_EDGE_FUNCTION + ' request error: ' + err);
     return false;
   }
 }

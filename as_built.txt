@@ -1,0 +1,58 @@
+================================================================================
+AS-BUILT — Outbound Lead-Response Automations
+Last updated: 2026-09-22
+================================================================================
+
+SCRIPTS
+- Code.gs — Google Apps Script running inside james@myadventuregroup.com.au's
+  mailbox. Every minute it scans the source label (follow-up-sequence-soc-med)
+  and, based on the LATEST message of each thread, routes it:
+    * Lead reply (external sender)  -> moves to
+      @-sales-to-action-outbound-lead-responses and sets the matching
+      follow_up_sequence_threads row status = '8A' + status_update_date (Sydney).
+    * Delivery failed / blocked (postmaster / Mail Delivery Subsystem) -> calls
+      the process_bounced_lead RPC to record the bounce, invokes the
+      process-bounced-leads Edge Function to push it to ActiveCampaign, then
+      moves the thread to follow-up-sequence-closed.
+    * James / our domain as last sender -> stays put.
+  Requires: Script Property SUPABASE_SERVICE_ROLE_KEY (Supabase service_role key
+  for MAGTestProject); standard Apps Script OAuth consent (Gmail + external
+  requests). Set up via testRunOnce -> processBacklogOnce -> createEveryMinuteTrigger.
+- appsscript.json — Apps Script manifest (timezone Australia/Sydney + minimal
+  OAuth scopes).
+
+EXTERNAL INTEGRATIONS
+- Supabase MAGTestProject (https://aivitcomiywiysrfwqxt.supabase.co) — accessed
+  from Code.gs via REST/PostgREST:
+    * PATCH /rest/v1/follow_up_sequence_threads (lead-reply status update)
+    * POST  /rest/v1/rpc/process_bounced_lead   (record a bounce)
+    * POST  /functions/v1/process-bounced-leads (Edge Function; action bounces)
+  Auth: service_role key in the Apps Script Script Property
+  SUPABASE_SERVICE_ROLE_KEY (never in code).
+- ActiveCampaign (https://myadventuregroup.api-us1.com) — reached only from the
+  process-bounced-leads Edge Function (server-side), not from Apps Script.
+  Credentials (AC_API_URL, AC_API_TOKEN) live as Supabase Edge Function secrets;
+  also present locally in creds.txt (gitignored, NOT committed).
+
+DATA STORES (Supabase MAGTestProject)
+- public.follow_up_sequence_threads — one row per outbound follow-up thread;
+  matched on thread_id; status '8A' set on lead reply. (RLS currently disabled.)
+- public.bounced_leads — one row per bounced lead (created by the
+  process_bounced_lead RPC); consumed by the process-bounced-leads Edge Function.
+  Columns include email, ac_deal_created, ac_note_datetime, lost_deal_datetime.
+
+AUTOMATIONS / ROUTINES
+- moveThreads() (Apps Script time trigger, every 1 minute) — the router above.
+- process-bounced-leads (Supabase Edge Function, version 2, ACTIVE, verify_jwt
+  off) — for each pending public.bounced_leads row: Phase A adds a deal note in
+  ActiveCampaign then stamps ac_note_datetime; Phase B sets the AC deal status to
+  Lost (2) then stamps lost_deal_datetime. Idempotent; timestamps written only
+  after the AC call succeeds. Requires Supabase secrets AC_API_URL, AC_API_TOKEN,
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY. Invoked per-bounce by Code.gs.
+
+OTHER
+- creds.txt — local-only credential file (AC_API_URL, AC_API_TOKEN,
+  SUPABASE_ACCESS_TOKEN). Gitignored; must never be committed.
+- "Soc Med Lead-Response Router.html" — standalone HTML write-up of the router
+  (replaces the earlier gmail-lead-response-router.html).
+================================================================================
