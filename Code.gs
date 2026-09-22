@@ -10,13 +10,23 @@
  * sender). James's own follow-ups leave the last message as "ours", so the
  * thread stays put until a lead actually responds.
  *
+ * Two Supabase side effects, each run BEFORE the label move so a transient error
+ * leaves the thread in place to retry next sweep (no silent desync):
+ *   - Lead reply  → set follow_up_sequence_threads.status = REPLIED_STATUS on the
+ *                   row matched by thread_id, and stamp status_update_date.
+ *   - Bounce/block → call the process_bounced_lead(_email_add_sent) RPC with the
+ *                    bounced recipient's email (bounced leads are NOT in that table),
+ *                    then move the thread to CLOSED_LABEL_TOKEN.
+ *   Bounce detection: latest message from postmaster / Mail Delivery Subsystem
+ *   saying "Delivery has failed" or "Message blocked".
+ *
  * Runs on a 1-minute time trigger. Idempotent: once moved, the source label is
  * removed, so the thread is never reprocessed (further replies land in the
  * destination label's thread and don't re-add the source label).
  *
- * Setup: see README.md. Run testRunOnce() once to authorize, run
- * processBacklogOnce() once to clear any already-replied threads, then run
- * createEveryMinuteTrigger() to schedule it.
+ * Setup: see README.md. Add the SUPABASE_SERVICE_ROLE_KEY Script Property, run
+ * testRunOnce() once to authorize, run processBacklogOnce() once to clear any
+ * already-replied threads, then run createEveryMinuteTrigger() to schedule it.
  */
 
 // ---------------------------------------------------------------------------
@@ -28,6 +38,9 @@ const SOURCE_LABEL_TOKEN = 'follow-up-sequence-soc-med';
 
 /** Gmail "label:" search token for the label to move replied-to threads into. */
 const DEST_LABEL_TOKEN = '@-sales-to-action-outbound-lead-responses';
+
+/** Gmail "label:" search token for the label to move bounced/blocked threads into. */
+const CLOSED_LABEL_TOKEN = 'follow-up-sequence-closed';
 
 /** Our own domain. A last message from this domain = James/us, NOT a lead reply. */
 const OUR_DOMAIN = 'myadventuregroup.com.au';
@@ -51,13 +64,41 @@ const BATCH_SIZE = 150;
 /** If the destination label can't be found, create it (with the literal token as its name). */
 const CREATE_DEST_IF_MISSING = true;
 
+// --- Supabase --------------------------------------------------------------
+// Lead reply  → set follow_up_sequence_threads.status = REPLIED_STATUS (matched on thread_id).
+// Bounce/block → call the process_bounced_lead RPC with the bounced recipient's email.
+//               (Bounced leads are NOT tracked in follow_up_sequence_threads.)
+
+/** Supabase project URL (MAGTestProject). */
+const SUPABASE_URL = 'https://aivitcomiywiysrfwqxt.supabase.co';
+
+/** Table holding one row per follow-up-sequence thread (lead-reply path only). */
+const SUPABASE_TABLE = 'follow_up_sequence_threads';
+
+/** Status set on a thread's row once the lead has replied and it's been actioned. */
+const REPLIED_STATUS = '8A';
+
+/** Postgres function (PostgREST RPC) to call for a bounced/blocked send, and its argument name. */
+const BOUNCE_RPC = 'process_bounced_lead';
+const BOUNCE_RPC_ARG = '_email_add_sent';
+
+/** Name of the Script Property that holds the Supabase service_role key (never hardcode the key). */
+const SUPABASE_KEY_PROPERTY = 'SUPABASE_SERVICE_ROLE_KEY';
+
+/**
+ * Timezone used to stamp status_update_date (a `timestamp without time zone`
+ * column). Sydney local wall-clock time, matching the project timezone.
+ */
+const STATUS_DATE_TIMEZONE = 'Australia/Sydney';
+
 // ---------------------------------------------------------------------------
 // Main (scheduled)
 // ---------------------------------------------------------------------------
 
 /**
- * Scheduled entry point. Moves threads whose latest message is a lead reply,
- * limited to threads with activity in the last ACTIVE_WINDOW_MINUTES.
+ * Scheduled entry point. Routes threads whose latest message is a lead reply
+ * (→ to-action) or a delivery failure/block (→ closed), limited to threads with
+ * activity in the last ACTIVE_WINDOW_MINUTES.
  */
 function moveThreads() {
   processRepliedThreads_(ACTIVE_WINDOW_MINUTES);
@@ -65,8 +106,8 @@ function moveThreads() {
 
 /**
  * One-time cleanup: scan the whole source label (up to BATCH_SIZE) with no time
- * window, and move every thread whose latest message is already a lead reply.
- * Run this once after deploying to clear any pre-existing replied threads.
+ * window, and route every thread whose latest message is already a lead reply or a
+ * bounce/block. Run this once after deploying to clear any pre-existing threads.
  */
 function processBacklogOnce() {
   processRepliedThreads_(null);
@@ -98,7 +139,14 @@ function processRepliedThreads_(windowMinutes) {
       return;
     }
 
-    // Newest-activity-first: a fresh lead reply bumps its thread to the top.
+    // Closed label is optional: if missing we still handle lead replies, just skip bounces.
+    const closed = resolveLabel_(CLOSED_LABEL_TOKEN, CREATE_DEST_IF_MISSING);
+    if (!closed) {
+      console.warn('Closed label not found: "' + CLOSED_LABEL_TOKEN +
+                   '". Bounced/blocked threads will be left in place this run.');
+    }
+
+    // Newest-activity-first: fresh activity (a reply or a bounce) bumps its thread to the top.
     const threads = GmailApp.search('label:' + SOURCE_LABEL_TOKEN, 0, BATCH_SIZE);
     if (threads.length === 0) {
       return;
@@ -108,6 +156,7 @@ function processRepliedThreads_(windowMinutes) {
 
     let inspected = 0;
     let moved = 0;
+    let closedCount = 0;
     for (let i = 0; i < threads.length; i++) {
       const thread = threads[i];
 
@@ -120,23 +169,66 @@ function processRepliedThreads_(windowMinutes) {
       const msgs = thread.getMessages();
       const last = msgs[msgs.length - 1];
 
-      if (isLeadReply_(last.getFrom())) {
-        try {
-          thread.addLabel(dest);
-          thread.removeLabel(source);
+      if (isBounceOrBlocked_(last)) {
+        // Delivery failed / blocked → call process_bounced_lead(email), then close the thread.
+        if (!closed) {
+          continue;
+        }
+        const bouncedEmail = getBouncedEmail_(thread);
+        if (!bouncedEmail) {
+          console.warn('Bounce detected on thread ' + thread.getId() +
+                       ' but could not determine the bounced recipient; leaving in place.');
+          continue;
+        }
+        // RPC first: if it fails, leave the thread in source to retry next sweep.
+        if (!processBouncedLead_(bouncedEmail)) {
+          continue;
+        }
+        if (moveLabels_(thread, closed, source)) {
+          closedCount++;
+        }
+      } else if (isLeadReply_(last.getFrom())) {
+        // Lead replied → move to the to-action label.
+        if (transferThread_(thread, dest, source, REPLIED_STATUS)) {
           moved++;
-        } catch (err) {
-          console.error('Failed to move thread ' + thread.getId() + ': ' + err);
         }
       }
     }
 
-    if (moved > 0 || windowMinutes == null) {
+    if (moved > 0 || closedCount > 0 || windowMinutes == null) {
       console.log('Inspected ' + inspected + ' thread(s); moved ' + moved +
-                  ' with a lead reply from "' + SOURCE_LABEL_TOKEN + '" to "' + DEST_LABEL_TOKEN + '".');
+                  ' (lead reply → "' + DEST_LABEL_TOKEN + '"), bounced ' + closedCount +
+                  ' (process_bounced_lead → "' + CLOSED_LABEL_TOKEN + '").');
     }
   } finally {
     lock.releaseLock();
+  }
+}
+
+/**
+ * Update Supabase status (DB first) then relabel a thread. If the Supabase update
+ * fails, the thread is left in place so it retries next sweep.
+ * @return {boolean} true if the thread was moved.
+ */
+function transferThread_(thread, destLabel, sourceLabel, status) {
+  if (!updateThreadStatus_(thread.getId(), status)) {
+    return false;
+  }
+  return moveLabels_(thread, destLabel, sourceLabel);
+}
+
+/**
+ * Relabel a thread: add destLabel, remove sourceLabel.
+ * @return {boolean} true on success.
+ */
+function moveLabels_(thread, destLabel, sourceLabel) {
+  try {
+    thread.addLabel(destLabel);
+    thread.removeLabel(sourceLabel);
+    return true;
+  } catch (err) {
+    console.error('Failed to move thread ' + thread.getId() + ': ' + err);
+    return false;
   }
 }
 
@@ -145,48 +237,233 @@ function processRepliedThreads_(windowMinutes) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Decide whether a message is a delivery failure / block notification:
+ * from postmaster or the Mail Delivery Subsystem (mailer-daemon), whose subject
+ * or body says "Delivery has failed" or "Message blocked".
+ * @param {GmailMessage} message
+ * @return {boolean}
+ */
+function isBounceOrBlocked_(message) {
+  const from = String(message.getFrom() || '').toLowerCase();
+  const fromSystemSender = from.indexOf('postmaster') !== -1 ||
+                           from.indexOf('mailer-daemon') !== -1 ||
+                           from.indexOf('mail delivery subsystem') !== -1;
+  if (!fromSystemSender) {
+    return false;
+  }
+
+  let body = '';
+  try {
+    body = message.getPlainBody() || '';
+  } catch (e) {
+    body = '';
+  }
+  const text = (String(message.getSubject() || '') + ' ' + body).toLowerCase();
+
+  return text.indexOf('delivery has failed') !== -1 ||
+         text.indexOf('message blocked') !== -1;
+}
+
+/**
  * Decide whether a message's "From" header represents a lead reply, i.e. an
  * external sender that is not one of our addresses and not a bounce/system sender.
  * @param {string} fromHeader  e.g. "Jane Doe <jane@leadco.com>" or "jane@leadco.com".
  * @return {boolean}
  */
 function isLeadReply_(fromHeader) {
-  const email = extractEmail_(fromHeader);
-  if (!email) {
-    return false;
-  }
+  return isExternalLeadAddress_(extractEmail_(fromHeader));
+}
 
-  // Ours (James / colleagues) → not a lead reply.
+/** True if the email is an external lead (not ours, not a system/bounce sender). */
+function isExternalLeadAddress_(email) {
+  return !!email && !isOurAddress_(email) && !isSystemSender_(email);
+}
+
+/** True if the email is one of ours (James / colleagues / configured aliases). */
+function isOurAddress_(email) {
   if (email.indexOf('@' + OUR_DOMAIN.toLowerCase()) !== -1) {
-    return false;
+    return true;
   }
-  if (OUR_EXTRA_ADDRESSES.map(function (a) { return a.toLowerCase(); }).indexOf(email) !== -1) {
-    return false;
-  }
+  return OUR_EXTRA_ADDRESSES.map(function (a) { return a.toLowerCase(); }).indexOf(email) !== -1;
+}
 
-  // Bounces / automated system senders → not a lead reply.
+/** True if the email looks like an automated / bounce system sender. */
+function isSystemSender_(email) {
   for (let i = 0; i < SYSTEM_SENDER_HINTS.length; i++) {
     if (email.indexOf(SYSTEM_SENDER_HINTS[i].toLowerCase()) !== -1) {
-      return false;
+      return true;
     }
   }
-
-  return true;
+  return false;
 }
 
 /**
- * Extract a lowercase email address from a "From" header value.
- * @param {string} fromHeader
+ * Find the bounced recipient's email for a thread: the external (lead) address
+ * that our outbound message(s) in the thread were sent to. Scans newest-first so
+ * the most recent send (the one that most likely bounced) wins.
+ * @param {GmailThread} thread
  * @return {string} lowercase email, or '' if none found.
  */
-function extractEmail_(fromHeader) {
-  if (!fromHeader) {
-    return '';
+function getBouncedEmail_(thread) {
+  const msgs = thread.getMessages();
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    const from = extractEmail_(m.getFrom());
+    if (!from || !isOurAddress_(from)) {
+      continue; // only look at messages WE sent
+    }
+    let recips = extractEmails_(m.getTo());
+    recips = recips.concat(extractEmails_(m.getCc()));
+    for (let j = 0; j < recips.length; j++) {
+      if (isExternalLeadAddress_(recips[j])) {
+        return recips[j];
+      }
+    }
   }
-  const angle = fromHeader.match(/<([^>]+)>/);
-  const raw = angle ? angle[1] : fromHeader;
-  const bare = raw.match(/[^\s<>@]+@[^\s<>@]+/);
-  return bare ? bare[0].trim().toLowerCase() : '';
+  return '';
+}
+
+/**
+ * Extract a lowercase email address from a single "From"-style header value.
+ * @param {string} headerValue
+ * @return {string} lowercase email, or '' if none found.
+ */
+function extractEmail_(headerValue) {
+  const all = extractEmails_(headerValue);
+  return all.length ? all[0] : '';
+}
+
+/**
+ * Extract all lowercase email addresses from a header value that may list several
+ * recipients (e.g. a "To"/"Cc" header).
+ * @param {string} headerValue
+ * @return {string[]}
+ */
+function extractEmails_(headerValue) {
+  if (!headerValue) {
+    return [];
+  }
+  const matches = String(headerValue).match(/[^\s<>@,;"']+@[^\s<>@,;"']+/g);
+  if (!matches) {
+    return [];
+  }
+  return matches.map(function (e) { return e.trim().toLowerCase(); });
+}
+
+// ---------------------------------------------------------------------------
+// Supabase status sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Set status = <status> and status_update_date = now (Sydney local) on the
+ * follow_up_sequence_threads row whose thread_id matches the given Gmail thread id,
+ * via the Supabase REST (PostgREST) API.
+ *
+ * @param {string} threadId  Gmail thread id (thread.getId()).
+ * @param {string} status    New status value (e.g. REPLIED_STATUS).
+ * @return {boolean} true on HTTP 2xx (including "no matching row" — logged as a
+ *                   warning so an untracked thread doesn't block routing); false
+ *                   on a missing key, non-2xx response, or thrown error.
+ */
+function updateThreadStatus_(threadId, status) {
+  const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
+  if (!key) {
+    console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
+                  '"; cannot update Supabase. Set it in Project Settings → Script Properties.');
+    return false;
+  }
+
+  const url = SUPABASE_URL + '/rest/v1/' + SUPABASE_TABLE +
+              '?thread_id=eq.' + encodeURIComponent(threadId);
+
+  // Local wall-clock stamp for the `timestamp without time zone` column, e.g. 2026-09-21T14:05:09.
+  const stamp = Utilities.formatDate(new Date(), STATUS_DATE_TIMEZONE, "yyyy-MM-dd'T'HH:mm:ss");
+
+  const options = {
+    method: 'patch',
+    contentType: 'application/json',
+    headers: {
+      apikey: key,
+      Authorization: 'Bearer ' + key,
+      Prefer: 'return=representation'
+    },
+    payload: JSON.stringify({ status: status, status_update_date: stamp }),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const resp = UrlFetchApp.fetch(url, options);
+    const code = resp.getResponseCode();
+    const body = resp.getContentText();
+
+    if (code >= 200 && code < 300) {
+      let rows = [];
+      try {
+        rows = JSON.parse(body);
+      } catch (e) {
+        rows = [];
+      }
+      if (!rows || rows.length === 0) {
+        console.warn('Supabase: no row found for thread_id ' + threadId +
+                     ' (thread will still be moved).');
+      }
+      return true;
+    }
+
+    console.error('Supabase update failed for thread_id ' + threadId +
+                  ' (HTTP ' + code + '): ' + body);
+    return false;
+  } catch (err) {
+    console.error('Supabase request error for thread_id ' + threadId + ': ' + err);
+    return false;
+  }
+}
+
+/**
+ * Call the process_bounced_lead(_email_add_sent) Postgres function via the Supabase
+ * PostgREST RPC endpoint, passing the bounced recipient's email.
+ *
+ * @param {string} email  The address that bounced.
+ * @return {boolean} true on HTTP 2xx; false on a missing key, non-2xx, or thrown error.
+ */
+function processBouncedLead_(email) {
+  const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
+  if (!key) {
+    console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
+                  '"; cannot call ' + BOUNCE_RPC + '. Set it in Project Settings → Script Properties.');
+    return false;
+  }
+
+  const url = SUPABASE_URL + '/rest/v1/rpc/' + BOUNCE_RPC;
+
+  const payload = {};
+  payload[BOUNCE_RPC_ARG] = email;
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: key,
+      Authorization: 'Bearer ' + key
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const resp = UrlFetchApp.fetch(url, options);
+    const code = resp.getResponseCode();
+    if (code >= 200 && code < 300) {
+      console.log('Called ' + BOUNCE_RPC + ' for bounced lead ' + email + '.');
+      return true;
+    }
+    console.error('Supabase RPC ' + BOUNCE_RPC + ' failed for ' + email +
+                  ' (HTTP ' + code + '): ' + resp.getContentText());
+    return false;
+  } catch (err) {
+    console.error('Supabase RPC ' + BOUNCE_RPC + ' error for ' + email + ': ' + err);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------

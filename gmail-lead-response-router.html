@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gmail Lead-Response Router</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Lato', Arial, sans-serif; background: #ffffff; }
+  .col { max-width: 760px; margin: 0 auto; padding: 32px 20px; }
+  .header-band {
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url(https://ssl.gstatic.com/atari/images/simple-header-blended-small.png) center/cover, #37474F;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+  }
+  .header-band h1 {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 44px;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px 0;
+    line-height: 1.2;
+  }
+  .header-band .subtitle {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 18px;
+    margin: 0;
+    opacity: 0.9;
+  }
+  .intro-band { background: #323232; }
+  .intro-band p {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .header-strip { background: #F2F2F2; }
+  .header-strip .col { padding: 32px 20px; }
+  .header-strip h2 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 400;
+    font-size: 26px;
+    margin: 0;
+  }
+  .content-band { background: #ffffff; }
+  .content-band h3 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    font-size: 19px;
+    margin: 24px 0 8px 0;
+  }
+  .content-band h3:first-child { margin-top: 0; }
+  .content-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 16px 0;
+  }
+  .content-band ul, .content-band ol {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    padding-left: 24px;
+    margin: 0 0 16px 0;
+  }
+  .content-band li { margin-bottom: 10px; }
+  .content-band a { color: #37474F; text-decoration: underline; }
+  .content-band code {
+    background: #F2F2F2;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 14px;
+  }
+  .placeholder-img {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    margin: 8px 0 4px 0;
+    border: 1px solid #e0e0e0;
+  }
+  .placeholder-caption {
+    color: #757575;
+    font-family: 'Lato', sans-serif;
+    font-size: 13px;
+    font-style: italic;
+    margin: 0 0 16px 0;
+  }
+  .closing-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 4px 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER BANNER (top of page only) -->
+<div class="header-band">
+  <div>
+    <h1>Gmail Lead-Response Router</h1>
+    <p class="subtitle">Outbound follow-up thread automation for James's mailbox</p>
+  </div>
+</div>
+
+<!-- TOP INTRO DARK BAND -->
+<div class="intro-band">
+  <div class="col">
+    <p>A Google Apps Script that runs inside James's Gmail mailbox and manages the outbound lead follow-up sequence. Once every minute it looks at the follow-up label and routes each thread based on what has happened to it — a lead replied, or a send bounced — moving the thread to the correct label, updating the follow-up tracking table when a lead responds, and handing bounced addresses off to a separate clean-up function. It runs entirely inside Gmail at no cost, with no servers, OAuth clients, or refresh tokens to maintain.</p>
+  </div>
+</div>
+
+<!-- SECTION: What it does -->
+<div class="header-strip">
+  <div class="col"><h2>What it does</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>James starts outbound follow-up email threads to leads, and those threads sit under a "follow-up sequence" label while he keeps following up. This automation watches that label and acts only when something meaningful happens on a thread:</p>
+    <ul>
+      <li>The <strong>lead replies</strong> — the thread moves to the "to-action" label so the team picks it up.</li>
+      <li>The <strong>send bounces or is blocked</strong> — the bounced address is handed to a clean-up routine and the thread is closed out.</li>
+      <li><strong>Nothing yet</strong> (James is the last to send) — the thread stays put, waiting.</li>
+    </ul>
+    <h3>The three labels involved</h3>
+    <ul>
+      <li><strong>Watched:</strong> <code>follow-up-sequence-soc-med</code> — where James's live outbound follow-ups live.</li>
+      <li><strong>Lead replied:</strong> <code>@-sales-to-action-outbound-lead-responses</code>.</li>
+      <li><strong>Bounced / blocked:</strong> <code>follow-up-sequence-closed</code>.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- SECTION: How it decides -->
+<div class="header-strip">
+  <div class="col"><h2>How it decides what to do</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>The automation is driven by the <strong>latest message</strong> in each thread, not by "a new email arrived". Once a minute it checks who sent the most recent message and routes accordingly:</p>
+    <ul>
+      <li><strong>James (our domain) sent last</strong> → the thread <strong>stays</strong> in the follow-up label. His own follow-ups never trigger a move; it waits for a genuine lead response.</li>
+      <li><strong>Delivery failed / blocked</strong> → if the latest message is from <em>postmaster</em> or the <em>Mail Delivery Subsystem</em> and says "Delivery has failed" or "Message blocked", the bounced address is processed (see below) and the thread moves to the closed label. This check runs first, so a failure notice is never mistaken for a reply.</li>
+      <li><strong>A lead replied</strong> → if the latest message is from an external sender (outside our domain, and not a bounce), the thread moves to the to-action label.</li>
+    </ul>
+    <h3>Why it is safe and self-correcting</h3>
+    <ul>
+      <li><strong>No double-handling:</strong> once a thread is moved it loses the follow-up label, so it is never processed again. Later replies stay on the thread under its new label.</li>
+      <li><strong>Action first:</strong> the database update or the bounce function runs before the labels are changed. If that step ever fails, the thread is left in place and retried on the next run — it is never moved out of sync.</li>
+      <li><strong>Efficient:</strong> each run only looks closely at threads with activity in roughly the last ten minutes, so it stays fast and light even when the follow-up label holds many open threads.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- SECTION: What happens on a lead reply -->
+<div class="header-strip">
+  <div class="col"><h2>When a lead replies</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>The thread is one that James is actively following up, so it is tracked in the <code>follow_up_sequence_threads</code> table (in the MAGTestProject Supabase project). When the lead replies, the automation updates that thread's row, matched on the Gmail thread ID, setting two columns:</p>
+    <ul>
+      <li><code>status</code> → <code>8A</code>.</li>
+      <li><code>status_update_date</code> → the current date and time (Sydney local time), so you can see exactly when the thread changed state.</li>
+    </ul>
+    <p>Then the thread moves to the to-action label. If a replied thread happens to have no matching row in the table, that is logged as a harmless warning and the thread is still moved.</p>
+  </div>
+</div>
+
+<!-- SECTION: What happens on a bounce -->
+<div class="header-strip">
+  <div class="col"><h2>When a send bounces</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Bounced leads are handled by a completely separate flow — they are <strong>not</strong> part of the <code>follow_up_sequence_threads</code> table. When a bounce is detected, the automation:</p>
+    <ol>
+      <li>Works out <strong>which address bounced</strong> — the external recipient that James's outbound message in that thread was sent to.</li>
+      <li>Calls the <code>process_bounced_lead</code> database function, passing that email address, so the bounce clean-up routine can do its job.</li>
+      <li>Moves the thread to the <code>follow-up-sequence-closed</code> label so it is not looked at again.</li>
+    </ol>
+    <p>The bounce function is called before the thread is moved, so if it ever fails the thread is left in place and retried on the next run — the bounce is never silently dropped.</p>
+  </div>
+</div>
+
+<!-- SECTION: Setup -->
+<div class="header-strip">
+  <div class="col"><h2>Setup (in James's mailbox)</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>The script must live under James's own Google account, because it acts on his mailbox. Setup is a one-time job in the Apps Script editor:</p>
+    <ol>
+      <li>Sign in as James at <a href="https://script.google.com">script.google.com</a> and create a new project.</li>
+      <li>Paste in the automation code and the project manifest (which pins the permissions it needs).</li>
+      <li>Add the Supabase service key as a Script Property so the database update and bounce function call can run.</li>
+      <li>Run the script once and approve the permissions prompt — this is the Google consent screen that grants access to Gmail and to make the Supabase calls.</li>
+      <li>Run the one-time backlog pass to catch any threads that already have a reply or a bounce.</li>
+      <li>Install the every-minute trigger so it runs automatically from then on.</li>
+    </ol>
+    <img class="placeholder-img" src="https://placehold.co/900x400/eeeeee/37474f?text=Apps%20Script%20editor%20%E2%80%94%20Run%20%26%20authorize" alt="Apps Script editor authorization step">
+    <p class="placeholder-caption">Placeholder image — replace with an actual screenshot.</p>
+  </div>
+</div>
+
+<!-- SECTION: Configuration -->
+<div class="header-strip">
+  <div class="col"><h2>Configuration reference</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>All the adjustable settings sit at the top of the script, so nothing needs to be hunted for in the logic:</p>
+    <ul>
+      <li><strong>Watched label</strong> — <code>follow-up-sequence-soc-med</code>.</li>
+      <li><strong>Lead-reply label</strong> — <code>@-sales-to-action-outbound-lead-responses</code>.</li>
+      <li><strong>Closed label</strong> — <code>follow-up-sequence-closed</code>.</li>
+      <li><strong>Reply status</strong> — <code>8A</code> (written to the tracking table on a lead reply).</li>
+      <li><strong>Bounce function</strong> — <code>process_bounced_lead</code>, called with the bounced email.</li>
+      <li><strong>Our domain</strong> — <code>myadventuregroup.com.au</code>; a last message from here counts as "us", not a lead.</li>
+      <li><strong>Activity window</strong> — how far back a scheduled run looks for fresh activity (about ten minutes).</li>
+      <li><strong>Timestamp timezone</strong> — <code>Australia/Sydney</code>, used to stamp <code>status_update_date</code>.</li>
+    </ul>
+    <p>Label names are matched flexibly, so they still work whether Gmail displays them with spaces or hyphens.</p>
+  </div>
+</div>
+
+<!-- SECTION: Monitoring & control -->
+<div class="header-strip">
+  <div class="col"><h2>Monitoring and turning it off</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <h3>Checking it is working</h3>
+    <ul>
+      <li>Open the <strong>Executions</strong> view in the Apps Script editor to see each run, how many threads were moved or bounced, and any warnings.</li>
+      <li>For a lead reply, confirm the thread's row in <code>follow_up_sequence_threads</code> shows status <code>8A</code> and a fresh <code>status_update_date</code>.</li>
+      <li>For a bounce, look for the log line confirming <code>process_bounced_lead</code> was called with the bounced address.</li>
+    </ul>
+    <h3>Pausing it</h3>
+    <p>Delete the every-minute trigger (or run the built-in "delete triggers" function). The code can stay in place — with no trigger, it simply never runs — and re-adding the trigger switches it back on.</p>
+    <h3>Good to know</h3>
+    <ul>
+      <li>An auto-reply / out-of-office from a lead counts as a response and will move the thread; genuine bounces from mail-system senders are handled by the bounce path instead.</li>
+      <li>If a bounced recipient can't be worked out from the thread, it is left in place and a warning is logged rather than guessing.</li>
+      <li>If James ever sends from an address outside our domain, that address should be added to the "treat as us" list so his messages are not mistaken for a lead reply.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FIXED SECTIONS -->
+<section id="h.68f0b8918457bce8_82" style="background:#ffffff;padding:8px 20px;"><div style="max-width:760px;margin:0 auto;"><hr style="border:none;border-top:1px solid #d9d9d9;margin:0;"></div></section>
+<section id="h.5a0263770fa94d5d_3" style="background:#ffffff;padding:24px 20px;"><div style="max-width:760px;margin:0 auto;"><a href="#" style="display:inline-block;font-family:'Lato',sans-serif;font-size:15px;font-weight:400;color:#ffffff;background:#37474F;padding:12px 28px;border-radius:4px;text-decoration:none;letter-spacing:0.3px;">Button label</a></div></section>
+
+<!-- CLOSING BAND -->
+<div class="closing-band">
+  <div class="col">
+    <p>Updated by: Julienne</p>
+    <p>Last Update: 22 September 2026</p>
+  </div>
+</div>
+
+</body>
+</html>
