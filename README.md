@@ -1,31 +1,42 @@
 # Gmail lead-response router — move a thread when the lead replies
 
 A Google Apps Script that runs inside **james@myadventuregroup.com.au**'s mailbox. It watches the
-outbound follow-up label and, **only once a lead replies**, moves the whole thread to the
+outbound follow-up labels and, **only once a lead replies**, moves the whole thread to the
 "to-action" label **and updates the thread's row in Supabase**.
 
-- **Source (watched):** `follow-up-sequence-soc-med` — where James's outbound follow-up threads live.
+It routes **two channels** (see the `CHANNELS` config in `Code.gs`) with identical logic — each has
+its own source label, Supabase threads table, and bounce RPC:
+
+| Channel | Source label (watched) | Threads table | Bounce RPC |
+|---------|------------------------|---------------|------------|
+| **soc-med** | `follow-up-sequence-soc-med` | `public.follow_up_sequence_threads` | `process_bounced_lead` |
+| **cold** | `follow-up-sequence-cold-leads` | `public.cold_leads_follow_up_sequence_threads` | `process_bounced_cold_lead` |
+
+Both channels share the same **destination** and **closed** labels and the same bounce Edge Function:
+
 - **Destination (lead replied):** `@-sales-to-action-outbound-lead-responses`.
 - **Closed (delivery failed/blocked):** `follow-up-sequence-closed`.
 - **Lead reply sync:** on a lead-reply move, sets the matching row's `status = '8A'` and
-  `status_update_date` (Sydney local time) in `public.follow_up_sequence_threads` (MAGTestProject),
-  matched on `thread_id`.
-- **Bounce handling:** bounced leads are **not** in `follow_up_sequence_threads`. On a bounce, the
-  script (1) calls the `process_bounced_lead(_email_add_sent)` RPC with the bounced recipient's email
-  to **record** the bounce, (2) invokes the **`process-bounced-leads` Edge Function** to push the
-  recorded bounces to ActiveCampaign (adds a deal note, then marks the deal Lost), then (3) moves the
-  thread to `follow-up-sequence-closed`.
+  `status_update_date` (Sydney local time) in the channel's threads table (MAGTestProject), matched
+  on `thread_id`.
+- **Bounce handling:** bounced leads are **not** in the threads table. On a bounce, the script
+  (1) calls the channel's `<bounce RPC>(_email_add_sent)` with the bounced recipient's email to
+  **record** the bounce (it sets `status = '10A'` on the matched source-lead row and inserts into
+  `public.bounced_leads`, tagging `lead_type` — `'soc med'` or `'cold'`), (2) invokes the
+  **`process-bounced-leads` Edge Function** to push the recorded bounces to ActiveCampaign (adds a
+  deal note, then marks the deal Lost), then (3) moves the thread to `follow-up-sequence-closed`. The
+  Edge Function is lead-type-agnostic, so both channels' bounces flow through the same invocation.
 
 ## How it decides to move a thread
 
-Every minute it looks at the **latest message** of each thread in the source label and routes based on
-who sent it:
+Every minute, **for each channel**, it looks at the **latest message** of each thread in that channel's
+source label and routes based on who sent it:
 
 | Event | Latest message | Result |
 |-------|----------------|--------|
-| James sends the first outbound / a follow-up | James (our domain) | **Stays** in `follow-up-sequence-soc-med` |
-| **Delivery failed / blocked** | postmaster or Mail Delivery Subsystem, saying *"Delivery has failed"* or *"Message blocked"* | Calls `process_bounced_lead(<bounced email>)`, invokes the `process-bounced-leads` Edge Function, then **moves** to `follow-up-sequence-closed` |
-| **Lead replies** | the lead (external, not a bounce/system sender) | **Moves** to `@-sales-to-action-outbound-lead-responses`, status → `8A` |
+| James sends the first outbound / a follow-up | James (our domain) | **Stays** in the channel's source label |
+| **Delivery failed / blocked** | postmaster or Mail Delivery Subsystem, saying *"Delivery has failed"* or *"Message blocked"* | Calls the channel's bounce RPC `<rpc>(<bounced email>)`, invokes the `process-bounced-leads` Edge Function, then **moves** to `follow-up-sequence-closed` |
+| **Lead replies** | the lead (external, not a bounce/system sender) | **Moves** to `@-sales-to-action-outbound-lead-responses`, status → `8A` (in the channel's threads table) |
 | Auto-reply / out-of-office from the lead | the lead (external) | Moves as a reply (counts as a response — see notes) |
 
 The bounce/block check runs first, so a delivery-failure notice closes the thread rather than being
@@ -94,22 +105,30 @@ James, have James do these steps or do them while signed in to his account.
 ## Config (top of `Code.gs`)
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `SOURCE_LABEL_TOKEN` | `follow-up-sequence-soc-med` | Label to watch (Gmail `label:` search token). |
-| `DEST_LABEL_TOKEN` | `@-sales-to-action-outbound-lead-responses` | Label to move replied threads to. |
-| `CLOSED_LABEL_TOKEN` | `follow-up-sequence-closed` | Label to move bounced/blocked threads to. |
+| `CHANNELS` | soc-med + cold (see below) | List of channels to route. Each row = `{ name, sourceLabel, threadsTable, bounceRpc }`. |
+| `DEST_LABEL_TOKEN` | `@-sales-to-action-outbound-lead-responses` | Label to move replied threads to (shared by all channels). |
+| `CLOSED_LABEL_TOKEN` | `follow-up-sequence-closed` | Label to move bounced/blocked threads to (shared). |
 | `OUR_DOMAIN` | `myadventuregroup.com.au` | A last message from this domain = us, not a lead reply. |
 | `OUR_EXTRA_ADDRESSES` | `[]` | Extra addresses to treat as "us" (e.g. an external alias James sends from). |
 | `SYSTEM_SENDER_HINTS` | mailer-daemon/postmaster/google no-reply | Senders ignored (bounces/automated). |
 | `ACTIVE_WINDOW_MINUTES` | `10` | Scheduled runs only inspect threads active within this window. |
-| `BATCH_SIZE` | `150` | Max threads examined per run. |
+| `BATCH_SIZE` | `150` | Max threads examined per channel per run. |
 | `CREATE_DEST_IF_MISSING` | `true` | Create the destination label if not found. |
 | `SUPABASE_URL` | `https://aivitcomiywiysrfwqxt.supabase.co` | MAGTestProject REST endpoint. |
-| `SUPABASE_TABLE` | `follow_up_sequence_threads` | Table updated on transfer. |
 | `REPLIED_STATUS` | `8A` | Status set on the thread's row when the lead replies. |
-| `BOUNCE_RPC` / `BOUNCE_RPC_ARG` | `process_bounced_lead` / `_email_add_sent` | RPC called on a bounce (records it), and its argument name. |
+| `BOUNCE_RPC_ARG` | `_email_add_sent` | Argument name shared by every channel's bounce RPC. |
 | `BOUNCE_EDGE_FUNCTION` | `process-bounced-leads` | Edge Function invoked after the RPC to push recorded bounces to ActiveCampaign. |
 | `STATUS_DATE_TIMEZONE` | `Australia/Sydney` | Timezone used to stamp `status_update_date`. |
 | `SUPABASE_KEY_PROPERTY` | `SUPABASE_SERVICE_ROLE_KEY` | Script Property name holding the service_role key. |
+
+**`CHANNELS` rows:**
+
+| `name` | `sourceLabel` | `threadsTable` | `bounceRpc` |
+|--------|---------------|----------------|-------------|
+| `soc-med` | `follow-up-sequence-soc-med` | `follow_up_sequence_threads` | `process_bounced_lead` |
+| `cold` | `follow-up-sequence-cold-leads` | `cold_leads_follow_up_sequence_threads` | `process_bounced_cold_lead` |
+
+To add another channel, append a row — no other code changes needed.
 
 **Label names vs. tokens:** the label values are Gmail `label:` **search tokens** (spaces become
 hyphens). The script matches them against your real labels by normalizing names, so it works whether a
@@ -127,9 +146,10 @@ label displays as `follow-up-sequence-soc-med` or `Follow Up Sequence Soc Med`.
   thread. If you want to exclude these, add sender hints to `SYSTEM_SENDER_HINTS`.
 - **Bounces / blocks** are detected on the latest message from postmaster or Mail Delivery Subsystem
   whose subject/body contains *"Delivery has failed"* or *"Message blocked"*. The bounced recipient's
-  email is taken from the address our outbound message(s) in that thread were sent to, then
-  `process_bounced_lead(<email>)` is called to record it, the `process-bounced-leads` Edge Function is
-  invoked to push it to ActiveCampaign, and finally the thread is moved to `follow-up-sequence-closed`.
+  email is taken from the address our outbound message(s) in that thread were sent to, then the
+  channel's bounce RPC (`process_bounced_lead` for soc-med, `process_bounced_cold_lead` for cold) is
+  called with `<email>` to record it, the `process-bounced-leads` Edge Function is invoked to push it
+  to ActiveCampaign, and finally the thread is moved to `follow-up-sequence-closed`.
   Other automated notices (e.g. "delayed") are ignored and the thread stays. If your provider phrases
   failures differently, add the phrase to `isBounceOrBlocked_`.
 - **Edge Function step:** `process-bounced-leads` takes no arguments — it processes **every** pending
@@ -138,10 +158,11 @@ label displays as `follow-up-sequence-soc-med` or `Follow Up Sequence Soc Med`.
   (e.g. ActiveCampaign or the function being down) leaves the thread in the source label and both steps
   retry on the next sweep. It authenticates with the same service_role key from Script Properties
   (`SUPABASE_SERVICE_ROLE_KEY`), which also serves as the `apikey` the Functions gateway requires.
-- **Bounce = RPC only, no table row:** the bounce path never touches `follow_up_sequence_threads`. If
+- **Bounce = RPC only, no table row:** the bounce path never touches the channel's threads table. If
   the bounced recipient can't be determined from the thread, the thread is left in place and a warning
   is logged. The RPC is called **before** the label move, so a transient failure retries next sweep —
-  make sure `process_bounced_lead` is safe to call more than once for the same email.
+  both `process_bounced_lead` and `process_bounced_cold_lead` are safe to call more than once for the
+  same email (they de-dup on `email` against `bounced_leads`).
 - **Closed label:** if `follow-up-sequence-closed` doesn't exist it's auto-created (same
   `CREATE_DEST_IF_MISSING` flag); confirm the intended label exists to avoid a differently-named
   duplicate.

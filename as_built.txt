@@ -1,20 +1,30 @@
 ================================================================================
 AS-BUILT — Outbound Lead-Response Automations
-Last updated: 2026-09-22
+Last updated: 2026-09-23
 ================================================================================
 
 SCRIPTS
 - Code.gs — Google Apps Script running inside james@myadventuregroup.com.au's
-  mailbox. Every minute it scans the source label (follow-up-sequence-soc-med)
-  and, based on the LATEST message of each thread, routes it:
+  mailbox. Every minute it routes each channel in a CHANNELS config array
+  (soc-med + cold) with identical logic; a channel row is
+  { name, sourceLabel, threadsTable, bounceRpc }. For each thread it acts on the
+  LATEST message:
     * Lead reply (external sender)  -> moves to
-      @-sales-to-action-outbound-lead-responses and sets the matching
-      follow_up_sequence_threads row status = '8A' + status_update_date (Sydney).
+      @-sales-to-action-outbound-lead-responses and sets the matching row in the
+      channel's threads table status = '8A' + status_update_date (Sydney).
     * Delivery failed / blocked (postmaster / Mail Delivery Subsystem) -> calls
-      the process_bounced_lead RPC to record the bounce, invokes the
+      the channel's bounce RPC to record the bounce, invokes the shared
       process-bounced-leads Edge Function to push it to ActiveCampaign, then
       moves the thread to follow-up-sequence-closed.
     * James / our domain as last sender -> stays put.
+  Channels:
+    * soc-med: label follow-up-sequence-soc-med, table follow_up_sequence_threads,
+      RPC process_bounced_lead.
+    * cold:    label follow-up-sequence-cold-leads,
+      table cold_leads_follow_up_sequence_threads, RPC process_bounced_cold_lead.
+  Shared: dest label @-sales-to-action-outbound-lead-responses, closed label
+  follow-up-sequence-closed, REPLIED_STATUS '8A', RPC arg _email_add_sent, Edge
+  Function process-bounced-leads. One script-wide lock wraps the whole sweep.
   Requires: Script Property SUPABASE_SERVICE_ROLE_KEY (Supabase service_role key
   for MAGTestProject); standard Apps Script OAuth consent (Gmail + external
   requests). Set up via testRunOnce -> processBacklogOnce -> createEveryMinuteTrigger.
@@ -24,8 +34,8 @@ SCRIPTS
 EXTERNAL INTEGRATIONS
 - Supabase MAGTestProject (https://aivitcomiywiysrfwqxt.supabase.co) — accessed
   from Code.gs via REST/PostgREST:
-    * PATCH /rest/v1/follow_up_sequence_threads (lead-reply status update)
-    * POST  /rest/v1/rpc/process_bounced_lead   (record a bounce)
+    * PATCH /rest/v1/<channel threads table> (lead-reply status update)
+    * POST  /rest/v1/rpc/<channel bounce RPC> (record a bounce)
     * POST  /functions/v1/process-bounced-leads (Edge Function; action bounces)
   Auth: service_role key in the Apps Script Script Property
   SUPABASE_SERVICE_ROLE_KEY (never in code).
@@ -35,24 +45,42 @@ EXTERNAL INTEGRATIONS
   also present locally in creds.txt (gitignored, NOT committed).
 
 DATA STORES (Supabase MAGTestProject)
-- public.follow_up_sequence_threads — one row per outbound follow-up thread;
-  matched on thread_id; status '8A' set on lead reply. (RLS currently disabled.)
-- public.bounced_leads — one row per bounced lead (created by the
-  process_bounced_lead RPC); consumed by the process-bounced-leads Edge Function.
-  Columns include email, ac_deal_created, ac_note_datetime, lost_deal_datetime.
+- public.follow_up_sequence_threads — one row per soc-med outbound follow-up
+  thread; matched on thread_id; status '8A' set on lead reply. (RLS disabled.)
+- public.cold_leads_follow_up_sequence_threads — same, for cold leads; status
+  '8A' set on lead reply.
+- Soc-med source lead lists: public.ai_scraped_soc_med_leads,
+  public.manually_found_leads. Cold source lead lists:
+  public.manually_found_cold_leads, public.ai_verified_cold_leads. On a bounce
+  the matched row's status is set to '10A'.
+- public.bounced_leads — one row per bounced lead (created by a bounce RPC);
+  consumed by the process-bounced-leads Edge Function. Columns include email,
+  ac_deal_created, ac_note_datetime, lost_deal_datetime, and lead_type
+  ('soc med' or 'cold', tagged on new inserts; pre-existing rows are NULL).
+
+FUNCTIONS (Supabase RPCs)
+- public.process_bounced_lead(_email_add_sent text) RETURNS SETOF bounced_leads —
+  soc-med: sets status '10A' on ai_scraped_soc_med_leads + manually_found_leads,
+  inserts a de-duplicated (on email) bounced_leads row with lead_type 'soc med'.
+- public.process_bounced_cold_lead(_email_add_sent text) RETURNS SETOF
+  bounced_leads — cold twin: sets status '10A' on manually_found_cold_leads +
+  ai_verified_cold_leads, inserts with lead_type 'cold'.
 
 AUTOMATIONS / ROUTINES
-- moveThreads() (Apps Script time trigger, every 1 minute) — the router above.
-- process-bounced-leads (Supabase Edge Function, version 2, ACTIVE, verify_jwt
-  off) — for each pending public.bounced_leads row: Phase A adds a deal note in
-  ActiveCampaign then stamps ac_note_datetime; Phase B sets the AC deal status to
-  Lost (2) then stamps lost_deal_datetime. Idempotent; timestamps written only
-  after the AC call succeeds. Requires Supabase secrets AC_API_URL, AC_API_TOKEN,
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY. Invoked per-bounce by Code.gs.
+- moveThreads() (Apps Script time trigger, every 1 minute) — the multi-channel
+  router above.
+- process-bounced-leads (Supabase Edge Function, ACTIVE, verify_jwt off) — for
+  each pending public.bounced_leads row (lead-type-agnostic): Phase A adds a deal
+  note in ActiveCampaign then stamps ac_note_datetime; Phase B sets the AC deal
+  status to Lost (2) then stamps lost_deal_datetime. Idempotent; timestamps
+  written only after the AC call succeeds. Requires Supabase secrets AC_API_URL,
+  AC_API_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY. Invoked per-bounce by
+  Code.gs for both channels.
 
 OTHER
 - creds.txt — local-only credential file (AC_API_URL, AC_API_TOKEN,
   SUPABASE_ACCESS_TOKEN). Gitignored; must never be committed.
-- "Soc Med Lead-Response Router.html" — standalone HTML write-up of the router
-  (replaces the earlier gmail-lead-response-router.html).
+- outbound-lead-response-automation.html — standalone iMAG-themed write-up of the
+  full end-to-end process (Gmail -> Supabase -> ActiveCampaign) for both channels.
+- "Lead-Response Router.html" — standalone HTML write-up of the router.
 ================================================================================

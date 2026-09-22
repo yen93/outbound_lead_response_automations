@@ -11,29 +11,52 @@ pasting `Code.gs` into a script.google.com project under James's account — thi
 repo is the source of truth, not a deploy target. There is no build step, no
 package manager, and no test suite.
 
+It routes **multiple channels** driven by the `CHANNELS` config array at the top
+of `Code.gs`. Each channel row is `{ name, sourceLabel, threadsTable, bounceRpc }`
+— the routing logic is identical; only those three values differ:
+
+| Channel | sourceLabel | threadsTable | bounceRpc |
+|---------|-------------|--------------|-----------|
+| soc-med | `follow-up-sequence-soc-med` | `follow_up_sequence_threads` | `process_bounced_lead` |
+| cold | `follow-up-sequence-cold-leads` | `cold_leads_follow_up_sequence_threads` | `process_bounced_cold_lead` |
+
+The dest/closed labels, `REPLIED_STATUS` (`8A`), the bounce RPC arg
+(`_email_add_sent`), and the `process-bounced-leads` Edge Function are shared
+across channels. Add a channel by appending a `CHANNELS` row.
+
 ## Architecture / flow (read before editing Code.gs)
 
-Every minute, `moveThreads()` -> `processRepliedThreads_()` scans the source
-label and inspects only threads active within `ACTIVE_WINDOW_MINUTES` (keeps
-Gmail reads tiny). For each thread it looks at the **last message**:
+Every minute, `moveThreads()` -> `processRepliedThreads_()` resolves the shared
+dest/closed labels once, then loops `CHANNELS` calling
+`processChannel_(channel, dest, closed, windowMinutes)`. Each channel scans its
+`sourceLabel` and inspects only threads active within `ACTIVE_WINDOW_MINUTES`
+(keeps Gmail reads tiny). One script-wide lock wraps the whole multi-channel
+sweep. For each thread it looks at the **last message**:
 
 - **Bounce/block** (postmaster / Mail Delivery Subsystem saying "Delivery has
   failed" / "Message blocked") — handled FIRST. Three ordered side-effects:
-  1. `processBouncedLead_(email)` — POST `/rest/v1/rpc/process_bounced_lead`
-     (Postgres RPC, arg `_email_add_sent`) to RECORD the bounce into
-     `public.bounced_leads`.
+  1. `processBouncedLead_(email, channel.bounceRpc)` — POST
+     `/rest/v1/rpc/<bounceRpc>` (Postgres RPC, arg `_email_add_sent`) to RECORD
+     the bounce into `public.bounced_leads`. The RPC sets `status='10A'` on the
+     matched source-lead row and tags `bounced_leads.lead_type` (`'soc med'` or
+     `'cold'`).
   2. `invokeProcessBouncedLeadsFunction_()` — POST
      `/functions/v1/process-bounced-leads` (Edge Function, takes NO args, acts
-     on all pending bounced_leads rows) to ACTION them in ActiveCampaign.
+     on all pending bounced_leads rows, lead-type-agnostic) to ACTION them in
+     ActiveCampaign. Shared by every channel.
   3. Move the thread to `follow-up-sequence-closed`.
 - **Lead reply** (external sender, not ours, not a system sender) —
-  `transferThread_()` sets `follow_up_sequence_threads.status = '8A'` +
+  `transferThread_()` sets `<channel.threadsTable>.status = '8A'` +
   `status_update_date`, then moves to the to-action label.
 - **Our domain last** — stays put.
 
-`process_bounced_lead` (RPC, underscores) and `process-bounced-leads` (Edge
-Function, hyphens) are DIFFERENT things and BOTH fire on a bounce — the RPC
-records, the function actions in ActiveCampaign. Don't conflate them.
+`process_bounced_lead` / `process_bounced_cold_lead` (RPCs, underscores) and
+`process-bounced-leads` (Edge Function, hyphens) are DIFFERENT things and BOTH
+fire on a bounce — the RPC records, the function actions in ActiveCampaign.
+Don't conflate them. The two RPCs are twins: same shape, differing only in the
+source tables they update (soc-med: `ai_scraped_soc_med_leads` +
+`manually_found_leads`; cold: `manually_found_cold_leads` +
+`ai_verified_cold_leads`) and the `lead_type` constant they insert.
 
 ## Critical conventions / gotchas
 

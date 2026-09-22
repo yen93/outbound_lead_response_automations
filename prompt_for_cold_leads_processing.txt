@@ -1,0 +1,17 @@
+## context:
+Soc Med Lead-Response Router only processes soc med leads in label:follow-up-sequence-soc-med. the tables involved are also only for soc med leads in supabase.
+
+## main task:
+recreate the automations to process "8A" and "10A" threads in appscript for the label:follow-up-sequence-cold-leads
+
+## 8A:
+supabase table to update is cold_leads_follow_up_sequence_threads
+
+## 10A supabase function (RPC):
+- create a separate supabase function (RPC) for cold leads called  process_bounced_cold_lead . this should be just like process_bounced_lead rpc function.
+- tables involved: manually_found_cold_leads, ai_verified_cold_leads
+- but insert them in the same bounced_leads table
+- i added a lead_type column. the supabase function (RPC) should set lead_type to 'soc med' if soc med and 'cold' if cold (case sensitive). pls also update the existing process_bounced_lead cos this lead_type tagging wasnt included there.
+
+## 10A Edge Function:
+- call/run the same edge function if there is a bounced thread

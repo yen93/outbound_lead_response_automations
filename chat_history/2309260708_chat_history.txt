@@ -1,0 +1,128 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-09-23
+Session: Add cold-leads lead-response routing (8A + bounce/10A) alongside the
+         existing soc-med router — new Supabase RPC, lead_type tagging, a
+         config-driven multi-channel Code.gs refactor, and an iMAG guide page.
+================================================================================
+
+NOTE ON REDACTIONS: No live secrets were pasted into this session. The only
+credential-shaped string in the working tree is a Supabase *publishable* key in
+the pre-existing "process-bounced-leads cURL invoke function.txt" (low-risk,
+already tracked). Live secrets remain only in creds.txt, which is gitignored and
+whose values are not reproduced anywhere in this transcript.
+
+--------------------------------------------------------------------------------
+USER:
+(Plan mode.) Context: the existing Soc Med Lead-Response Router only processes
+soc-med leads in label:follow-up-sequence-soc-med, with soc-med-only Supabase
+tables. Main task: recreate the automations to process "8A" and "10A" threads in
+Apps Script for label:follow-up-sequence-cold-leads.
+- 8A: update Supabase table cold_leads_follow_up_sequence_threads.
+- 10A RPC: create a separate RPC process_bounced_cold_lead, just like
+  process_bounced_lead, over tables manually_found_cold_leads and
+  ai_verified_cold_leads, inserting into the same bounced_leads table. A new
+  lead_type column should be set to 'soc med' for soc med and 'cold' for cold
+  (case-sensitive); also update the existing process_bounced_lead to add this
+  tagging.
+- 10A Edge Function: call/run the same edge function on a bounced thread.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read Code.gs, README.md, and the reference files, and launched an Explore agent
+against Supabase (MAGTestProject, ref aivitcomiywiysrfwqxt) to pull the schema.
+Key findings:
+- process_bounced_lead(text) updates two soc-med source tables
+  (ai_scraped_soc_med_leads, manually_found_leads) to status '10A' and inserts a
+  de-duplicated row into bounced_leads; it did NOT set lead_type.
+- bounced_leads.lead_type is text, nullable, no default (always NULL so far).
+- Cold source tables manually_found_cold_leads and ai_verified_cold_leads carry
+  the needed columns (email, status, ac_contact_created, ac_account_created,
+  ac_deal_created). Cold threads table cold_leads_follow_up_sequence_threads is
+  the analog of follow_up_sequence_threads.
+- The process-bounced-leads Edge Function is lead-type-agnostic, so cold rows
+  flow through it unchanged. process_bounced_cold_lead did not yet exist.
+Established that "8A" = lead-reply path and "10A" = bounce path (the status the
+RPC sets on source tables), mapping onto the two existing Code.gs branches.
+
+Asked three clarifying questions. Answers: (1) recommend an approach for the
+Apps Script structure; (2) cold leads use the SAME dest/closed labels as
+soc-med; (3) set status '10A' on cold source tables, mirroring soc-med.
+Recommended a config-driven multi-channel Code.gs (one CHANNELS array looped
+over) rather than a duplicate script, since the logic is identical bar three
+values. Wrote the plan to the plan file and exited plan mode; user approved.
+
+--------------------------------------------------------------------------------
+USER:
+(Implicit approval of the plan.)
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Implemented in three parts.
+
+Supabase (two migrations applied via MCP apply_migration to MAGTestProject):
+- tag_lead_type_soc_med_on_process_bounced_lead: CREATE OR REPLACE
+  process_bounced_lead unchanged except the final INSERT now adds lead_type with
+  the constant 'soc med'.
+- create_process_bounced_cold_lead: new twin RPC updating manually_found_cold_leads
+  and ai_verified_cold_leads to status '10A', de-duping on email, inserting into
+  bounced_leads with lead_type 'cold'; RETURNS SETOF bounced_leads.
+Verified both functions exist with signature (_email_add_sent text), and ran a
+non-destructive smoke test (a sentinel no-match email) returning 0 rows for each
+with no type/column errors.
+
+Code.gs (config-driven multi-channel refactor):
+- Added a CHANNELS array with soc-med and cold rows, each { name, sourceLabel,
+  threadsTable, bounceRpc }; removed the single SOURCE_LABEL_TOKEN, SUPABASE_TABLE,
+  and BOUNCE_RPC constants; kept BOUNCE_RPC_ARG and the shared dest/closed labels,
+  REPLIED_STATUS, edge function, etc.
+- processRepliedThreads_() now resolves the shared dest/closed labels once and
+  loops CHANNELS into a new processChannel_(channel, dest, closed, windowMinutes)
+  helper, under a single script-wide lock.
+- Threaded the per-channel table/RPC through transferThread_ ->
+  updateThreadStatus_(threadId, status, table) and processBouncedLead_(email, rpc);
+  log lines are channel-prefixed. Bounce path keeps parity (never touches the
+  threads table). Updated the header doc comment.
+- Confirmed via a temp .js copy that node --check passes, and grepped to confirm
+  no stale constant references and consistent call/definition arities.
+
+Docs: updated README.md (intro, channel table, decision table, config table with
+a CHANNELS sub-table, bounce notes) and CLAUDE.md (multi-channel architecture,
+the twin RPCs, lead_type). Flagged that lead_type is only set on NEW bounce
+inserts (existing rows stay NULL) and that deployment is manual (paste Code.gs,
+apply migrations); no new secrets/scopes. Did not commit (user had not asked).
+
+--------------------------------------------------------------------------------
+USER:
+Run /imag_page_local and create one iMAG page for the entire process from Gmail
+to ActiveCampaign, for both soc-med and cold.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Invoked the imag_page_local skill, read its template.html, and compiled the
+end-to-end process from this session's verified facts. Wrote
+outbound-lead-response-automation.html at the project root — a single
+self-contained iMAG-themed page (Lato, dark header banner, dark intro band, gray
+header strips + white content bands, the fixed divider/button sections, closing
+band "Updated by: Julienne / Last Update: 22 September 2026"). Sections: the big
+picture; the two channels; how a thread is routed; the lead-reply (8A) path; the
+bounce (10A) path; what happens inside Supabase; what happens in ActiveCampaign;
+and why it's safe/reliable. One illustrative placeholder image; no secrets.
+
+--------------------------------------------------------------------------------
+USER:
+Ran /dcp to document, commit, and push.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Timestamped and wrote this chat_history file, updated as_built.txt (cold channel,
+new RPC, lead_type, the iMAG page) and CLAUDE.md (already multi-channel-aware
+from the implementation step). Ran the security gate over all files to be staged
+(only secret name/location references and the pre-existing low-risk publishable
+key; creds.txt gitignored). Noted pre-existing working-tree changes not from this
+session (Soc Med Lead-Response Router.html renamed to Lead-Response Router.html;
+prompt_for_cold_leads_processing.txt added), staged the legitimate changes,
+committed, and pushed to origin/main.
+
+================================================================================
+END OF EXPORT
+================================================================================

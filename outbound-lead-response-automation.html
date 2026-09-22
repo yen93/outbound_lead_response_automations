@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Outbound Lead-Response Automation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Lato', Arial, sans-serif; background: #ffffff; }
+  .col { max-width: 760px; margin: 0 auto; padding: 32px 20px; }
+  .header-band {
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url(https://ssl.gstatic.com/atari/images/simple-header-blended-small.png) center/cover, #37474F;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+  }
+  .header-band h1 {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 44px;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px 0;
+    line-height: 1.2;
+  }
+  .header-band .subtitle {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 18px;
+    margin: 0;
+    opacity: 0.9;
+  }
+  .intro-band { background: #323232; }
+  .intro-band p {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .header-strip { background: #F2F2F2; }
+  .header-strip .col { padding: 32px 20px; }
+  .header-strip h2 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 400;
+    font-size: 26px;
+    margin: 0;
+  }
+  .content-band { background: #ffffff; }
+  .content-band h3 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    font-size: 19px;
+    margin: 24px 0 8px 0;
+  }
+  .content-band h3:first-child { margin-top: 0; }
+  .content-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 16px 0;
+  }
+  .content-band ul, .content-band ol {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    padding-left: 24px;
+    margin: 0 0 16px 0;
+  }
+  .content-band li { margin-bottom: 10px; }
+  .content-band a { color: #37474F; text-decoration: underline; }
+  .content-band code {
+    background: #F2F2F2;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 14px;
+  }
+  .placeholder-img {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    margin: 8px 0 4px 0;
+    border: 1px solid #e0e0e0;
+  }
+  .placeholder-caption {
+    color: #757575;
+    font-family: 'Lato', sans-serif;
+    font-size: 13px;
+    font-style: italic;
+    margin: 0 0 16px 0;
+  }
+  .closing-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 4px 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER BANNER (top of page only) -->
+<div class="header-band">
+  <div>
+    <h1>Outbound Lead-Response Automation</h1>
+    <p class="subtitle">From Gmail to ActiveCampaign, for both soc-med and cold leads</p>
+  </div>
+</div>
+
+<!-- TOP INTRO DARK BAND -->
+<div class="intro-band">
+  <div class="col">
+    <p>This automation watches James's outbound follow-up threads in Gmail and, the moment a lead
+    responds, routes the thread and updates the records behind it — all the way through to
+    ActiveCampaign. It runs every minute inside <code>james@myadventuregroup.com.au</code>'s mailbox
+    and handles two lead channels, <strong>soc-med</strong> and <strong>cold</strong>, with identical
+    logic. A genuine reply is sent to the sales team to action; a delivery failure is recorded and the
+    matching deal is closed off automatically. This page explains the whole path, end to end.</p>
+  </div>
+</div>
+
+<!-- SECTION 1 -->
+<div class="header-strip">
+  <div class="col"><h2>The big picture</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>James sends outbound follow-up emails from his mailbox. Each follow-up thread lives under a
+    Gmail label for its channel and <strong>stays there while he keeps following up</strong>. A small
+    script checks those threads once a minute and reacts only to what the lead does:</p>
+    <ul>
+      <li><strong>The lead replies</strong> → the thread moves to the sales "to-action" label and the
+      lead's record is stamped as replied (status <code>8A</code>).</li>
+      <li><strong>The email bounces or is blocked</strong> → the bounce is recorded, the lead's record
+      is marked bounced (status <code>10A</code>), and the deal is closed off in ActiveCampaign with an
+      automatic note. The thread moves to a "closed" label.</li>
+      <li><strong>James sends another follow-up</strong> → nothing moves; the thread waits for a real
+      lead response.</li>
+    </ul>
+    <p>The journey in one line: <strong>Gmail thread → every-minute check → Supabase (record the
+    outcome) → ActiveCampaign (act on a bounce) → Gmail label move.</strong></p>
+    <img class="placeholder-img" src="https://placehold.co/900x400/eeeeee/37474f?text=End-to-end%20flow%3A%20Gmail%20%E2%86%92%20Supabase%20%E2%86%92%20ActiveCampaign" alt="End-to-end flow diagram">
+    <p class="placeholder-caption">Placeholder image — replace with an actual screenshot.</p>
+  </div>
+</div>
+
+<!-- SECTION 2 -->
+<div class="header-strip">
+  <div class="col"><h2>The two channels</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Both channels behave the same way. They differ only in which Gmail label they watch and which
+    Supabase records they update. Everything else — the sales "to-action" label, the "closed" label,
+    the reply status, and the ActiveCampaign step — is shared.</p>
+    <h3>Soc-med leads</h3>
+    <ul>
+      <li>Watched Gmail label: <code>follow-up-sequence-soc-med</code></li>
+      <li>Thread record table: <code>follow_up_sequence_threads</code></li>
+      <li>Source lead lists: <code>ai_scraped_soc_med_leads</code>, <code>manually_found_leads</code></li>
+    </ul>
+    <h3>Cold leads</h3>
+    <ul>
+      <li>Watched Gmail label: <code>follow-up-sequence-cold-leads</code></li>
+      <li>Thread record table: <code>cold_leads_follow_up_sequence_threads</code></li>
+      <li>Source lead lists: <code>manually_found_cold_leads</code>, <code>ai_verified_cold_leads</code></li>
+    </ul>
+    <h3>Shared by both channels</h3>
+    <ul>
+      <li>Lead-replied label: <code>@-sales-to-action-outbound-lead-responses</code></li>
+      <li>Closed (bounced) label: <code>follow-up-sequence-closed</code></li>
+      <li>The same bounce-to-ActiveCampaign step processes both channels' bounces.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- SECTION 3 -->
+<div class="header-strip">
+  <div class="col"><h2>How a thread is routed</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Once a minute the script sweeps each channel's label. To stay fast, it only looks closely at
+    threads that had activity in roughly the last 10 minutes. For each of those, it reads the
+    <strong>last message</strong> in the thread and decides who sent it:</p>
+    <ol>
+      <li><strong>A bounce or block?</strong> Checked first — a message from <em>postmaster</em> or the
+      <em>Mail Delivery Subsystem</em> whose text says "Delivery has failed" or "Message blocked".</li>
+      <li><strong>A lead reply?</strong> Any external sender that isn't us and isn't an automated
+      system sender.</li>
+      <li><strong>One of us?</strong> A message from our own domain (James or a colleague) means the
+      thread simply stays put.</li>
+    </ol>
+    <p>Because the decision is based on the <em>latest</em> message, James can keep following up as
+    many times as he likes and the thread won't move until the lead actually does something.</p>
+    <p>Auto-replies and out-of-office messages from the lead's own address count as a response and will
+    move the thread — they are treated as a genuine reply.</p>
+  </div>
+</div>
+
+<!-- SECTION 4 -->
+<div class="header-strip">
+  <div class="col"><h2>When a lead replies (status 8A)</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>This is the happy path — the lead has come back to us. The script does two things, in this
+    order:</p>
+    <ol>
+      <li><strong>Update the record first.</strong> In the channel's thread table, it finds the row for
+      that Gmail thread and sets <code>status = 8A</code> with a fresh timestamp (Sydney local time).</li>
+      <li><strong>Then move the thread</strong> into <code>@-sales-to-action-outbound-lead-responses</code>
+      so the sales team sees it and can action the response.</li>
+    </ol>
+    <p>The record is updated <em>before</em> the label moves on purpose: if the update can't go through
+    for any reason, the thread is left where it is and the next sweep tries again — so the Gmail label
+    and the database never drift out of step.</p>
+  </div>
+</div>
+
+<!-- SECTION 5 -->
+<div class="header-strip">
+  <div class="col"><h2>When an email bounces (status 10A)</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>If the last message is a delivery failure or block, the lead never received the email, so the
+    thread is closed off and the deal is tidied up in ActiveCampaign. The script works out which
+    address bounced (the one our outbound message was sent to) and then runs three steps in order:</p>
+    <ol>
+      <li><strong>Record the bounce in Supabase.</strong> It calls the channel's bounce function —
+      <code>process_bounced_lead</code> for soc-med, <code>process_bounced_cold_lead</code> for cold.
+      That function marks the matching source-lead record as bounced (<code>status = 10A</code>) and
+      adds a row to the shared <code>bounced_leads</code> table, tagged with its <code>lead_type</code>
+      — <code>soc med</code> or <code>cold</code>.</li>
+      <li><strong>Action it in ActiveCampaign.</strong> It then triggers the
+      <code>process-bounced-leads</code> step, which handles every pending bounced record the same way,
+      regardless of channel (see the next section).</li>
+      <li><strong>Move the thread</strong> into <code>follow-up-sequence-closed</code>.</li>
+    </ol>
+    <p>As with the reply path, both Supabase steps run <em>before</em> the thread is moved. If either
+    step fails, the thread stays in place and the whole sequence is retried on the next sweep. All the
+    steps are safe to repeat, so a retry never double-records or double-closes anything.</p>
+  </div>
+</div>
+
+<!-- SECTION 6 -->
+<div class="header-strip">
+  <div class="col"><h2>What happens inside Supabase</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Supabase is the system of record that sits between Gmail and ActiveCampaign. Three kinds of
+    pieces are involved:</p>
+    <h3>Thread tables (the reply path)</h3>
+    <ul>
+      <li>Soc-med: <code>follow_up_sequence_threads</code></li>
+      <li>Cold: <code>cold_leads_follow_up_sequence_threads</code></li>
+      <li>On a reply, the row matching the Gmail thread is set to <code>status = 8A</code>.</li>
+    </ul>
+    <h3>Bounce functions (the bounce path)</h3>
+    <ul>
+      <li><code>process_bounced_lead</code> (soc-med) and <code>process_bounced_cold_lead</code> (cold)
+      are twins: each updates its own source-lead lists to <code>status = 10A</code> and inserts a
+      de-duplicated row into <code>bounced_leads</code>.</li>
+      <li>The difference is only which lists they read and the <code>lead_type</code> tag they write
+      (<code>soc med</code> vs <code>cold</code>), so ActiveCampaign can tell the channels apart later.</li>
+      <li>They de-duplicate on the email address, so the same bounce is never recorded twice.</li>
+    </ul>
+    <h3>The shared bounce-to-ActiveCampaign step</h3>
+    <ul>
+      <li><code>process-bounced-leads</code> is a single shared routine that reads the
+      <code>bounced_leads</code> table and pushes each pending row to ActiveCampaign.</li>
+      <li>It doesn't care which channel a row came from — soc-med and cold bounces flow through exactly
+      the same step.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- SECTION 7 -->
+<div class="header-strip">
+  <div class="col"><h2>What happens in ActiveCampaign</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>The final stop is ActiveCampaign, and it only comes into play on a <strong>bounce</strong>. For
+    each recorded bounce, the shared step does two things to that lead's deal, each only once:</p>
+    <ul>
+      <li><strong>Adds a note to the deal</strong> explaining that the intro email to that address
+      bounced and that the deal has been marked lost — noting it was done automatically.</li>
+      <li><strong>Marks the deal as Lost</strong> so it drops out of the active pipeline.</li>
+    </ul>
+    <p>Each part is stamped once it succeeds, so if the step runs again it skips anything already done.
+    A lead reply does <em>not</em> touch ActiveCampaign — replies are handed to the sales team through
+    Gmail to action personally.</p>
+  </div>
+</div>
+
+<!-- SECTION 8 -->
+<div class="header-strip">
+  <div class="col"><h2>Why it's safe and reliable</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <ul>
+      <li><strong>Record first, move second.</strong> Every database and ActiveCampaign step runs
+      before the Gmail label is changed. A transient failure just leaves the thread in place to retry —
+      the label and the records never fall out of sync.</li>
+      <li><strong>Safe to repeat.</strong> Recording a bounce, closing a deal, and stamping a reply are
+      all idempotent, so a retry can never double-process a lead.</li>
+      <li><strong>Runs continuously, cheaply.</strong> The check runs every minute but only inspects
+      threads with recent activity, so it stays light even when hundreds of follow-ups are open.</li>
+      <li><strong>One shared logic, two channels.</strong> Soc-med and cold run through the same code;
+      a channel is just a small configuration entry, which keeps their behaviour perfectly in step.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FIXED SECTIONS -->
+<section id="h.68f0b8918457bce8_82" style="background:#ffffff;padding:8px 20px;"><div style="max-width:760px;margin:0 auto;"><hr style="border:none;border-top:1px solid #d9d9d9;margin:0;"></div></section>
+<section id="h.5a0263770fa94d5d_3" style="background:#ffffff;padding:24px 20px;"><div style="max-width:760px;margin:0 auto;"><a href="#" style="display:inline-block;font-family:'Lato',sans-serif;font-size:15px;font-weight:400;color:#ffffff;background:#37474F;padding:12px 28px;border-radius:4px;text-decoration:none;letter-spacing:0.3px;">Button label</a></div></section>
+
+<!-- CLOSING BAND -->
+<div class="closing-band">
+  <div class="col">
+    <p>Updated by: Julienne</p>
+    <p>Last Update: 22 September 2026</p>
+  </div>
+</div>
+
+</body>
+</html>

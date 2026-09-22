@@ -1,9 +1,9 @@
 /**
  * Gmail lead-response router for james@myadventuregroup.com.au
  * ------------------------------------------------------------
- * The source label holds OUTBOUND follow-up threads James started. They should
- * STAY there while James keeps following up, and only move to the destination
- * label once a LEAD REPLIES.
+ * Each source label (see CHANNELS: soc-med + cold) holds OUTBOUND follow-up
+ * threads James started. They should STAY there while James keeps following up,
+ * and only move to the destination label once a LEAD REPLIES.
  *
  * Trigger rule: a thread is moved only when the LAST message in the thread is
  * from a lead — i.e. a sender outside our own domain (and not a bounce/system
@@ -11,14 +11,18 @@
  * thread stays put until a lead actually responds.
  *
  * Two Supabase side effects, each run BEFORE the label move so a transient error
- * leaves the thread in place to retry next sweep (no silent desync):
- *   - Lead reply  → set follow_up_sequence_threads.status = REPLIED_STATUS on the
+ * leaves the thread in place to retry next sweep (no silent desync). Each channel
+ * uses its own threads table + bounce RPC (see CHANNELS); the dest/closed labels
+ * and the bounce Edge Function are shared:
+ *   - Lead reply  → set <channel.threadsTable>.status = REPLIED_STATUS on the
  *                   row matched by thread_id, and stamp status_update_date.
- *   - Bounce/block → call the process_bounced_lead(_email_add_sent) RPC with the
- *                    bounced recipient's email (bounced leads are NOT in that table)
- *                    to record it, then invoke the process-bounced-leads Edge
- *                    Function to push those bounced leads to ActiveCampaign (deal
- *                    note + mark Lost), then move the thread to CLOSED_LABEL_TOKEN.
+ *   - Bounce/block → call the channel's bounce RPC (process_bounced_lead for
+ *                    soc-med, process_bounced_cold_lead for cold), taking
+ *                    _email_add_sent, with the bounced recipient's email (bounced
+ *                    leads are NOT in the threads table) to record it, then invoke
+ *                    the process-bounced-leads Edge Function to push those bounced
+ *                    leads to ActiveCampaign (deal note + mark Lost), then move the
+ *                    thread to CLOSED_LABEL_TOKEN.
  *   Bounce detection: latest message from postmaster / Mail Delivery Subsystem
  *   saying "Delivery has failed" or "Message blocked".
  *
@@ -35,8 +39,33 @@
 // Config
 // ---------------------------------------------------------------------------
 
-/** Gmail "label:" search token for the label to watch (outbound follow-ups). */
-const SOURCE_LABEL_TOKEN = 'follow-up-sequence-soc-med';
+/**
+ * Channels processed each sweep. The routing logic is identical for every
+ * channel — only three things differ, so each channel is one config row:
+ *   - sourceLabel  : Gmail "label:" search token to watch (outbound follow-ups).
+ *   - threadsTable : Supabase table whose row (matched on thread_id) gets
+ *                    status = REPLIED_STATUS on a lead reply.
+ *   - bounceRpc    : Postgres function (PostgREST RPC) called on a bounce to
+ *                    record it into public.bounced_leads.
+ * Everything else (dest/closed labels, REPLIED_STATUS, the RPC arg name, the
+ * Edge Function, domain, windows, timezone, key property) is shared below.
+ * The bounce Edge Function (process-bounced-leads) is lead-type-agnostic, so
+ * both channels' bounces flow through the same invocation.
+ */
+const CHANNELS = [
+  {
+    name: 'soc-med',
+    sourceLabel: 'follow-up-sequence-soc-med',
+    threadsTable: 'follow_up_sequence_threads',
+    bounceRpc: 'process_bounced_lead'
+  },
+  {
+    name: 'cold',
+    sourceLabel: 'follow-up-sequence-cold-leads',
+    threadsTable: 'cold_leads_follow_up_sequence_threads',
+    bounceRpc: 'process_bounced_cold_lead'
+  }
+];
 
 /** Gmail "label:" search token for the label to move replied-to threads into. */
 const DEST_LABEL_TOKEN = '@-sales-to-action-outbound-lead-responses';
@@ -74,14 +103,14 @@ const CREATE_DEST_IF_MISSING = true;
 /** Supabase project URL (MAGTestProject). */
 const SUPABASE_URL = 'https://aivitcomiywiysrfwqxt.supabase.co';
 
-/** Table holding one row per follow-up-sequence thread (lead-reply path only). */
-const SUPABASE_TABLE = 'follow_up_sequence_threads';
-
 /** Status set on a thread's row once the lead has replied and it's been actioned. */
 const REPLIED_STATUS = '8A';
 
-/** Postgres function (PostgREST RPC) to call for a bounced/blocked send, and its argument name. */
-const BOUNCE_RPC = 'process_bounced_lead';
+/**
+ * Argument name shared by every channel's bounce RPC (each channel's function
+ * name lives in CHANNELS[].bounceRpc). Both process_bounced_lead and
+ * process_bounced_cold_lead take a single `_email_add_sent` text arg.
+ */
 const BOUNCE_RPC_ARG = '_email_add_sent';
 
 /**
@@ -124,7 +153,8 @@ function processBacklogOnce() {
 }
 
 /**
- * Core routine.
+ * Core routine. Resolves the shared destination/closed labels once, then routes
+ * every channel in CHANNELS (soc-med + cold) under a single script-wide lock.
  * @param {number|null} windowMinutes  Only inspect threads active within this many
  *                                     minutes; null = no time filter (backlog mode).
  */
@@ -136,12 +166,6 @@ function processRepliedThreads_(windowMinutes) {
   }
 
   try {
-    const source = resolveLabel_(SOURCE_LABEL_TOKEN, false);
-    if (!source) {
-      console.log('Source label not found: "' + SOURCE_LABEL_TOKEN + '". Nothing to do.');
-      return;
-    }
-
     const dest = resolveLabel_(DEST_LABEL_TOKEN, CREATE_DEST_IF_MISSING);
     if (!dest) {
       console.log('Destination label not found and CREATE_DEST_IF_MISSING is false: "' +
@@ -156,66 +180,8 @@ function processRepliedThreads_(windowMinutes) {
                    '". Bounced/blocked threads will be left in place this run.');
     }
 
-    // Newest-activity-first: fresh activity (a reply or a bounce) bumps its thread to the top.
-    const threads = GmailApp.search('label:' + SOURCE_LABEL_TOKEN, 0, BATCH_SIZE);
-    if (threads.length === 0) {
-      return;
-    }
-
-    const cutoffMs = windowMinutes == null ? null : (Date.now() - windowMinutes * 60 * 1000);
-
-    let inspected = 0;
-    let moved = 0;
-    let closedCount = 0;
-    for (let i = 0; i < threads.length; i++) {
-      const thread = threads[i];
-
-      // Cheap metadata check: skip threads with no recent activity (no message fetch).
-      if (cutoffMs != null && thread.getLastMessageDate().getTime() < cutoffMs) {
-        continue;
-      }
-
-      inspected++;
-      const msgs = thread.getMessages();
-      const last = msgs[msgs.length - 1];
-
-      if (isBounceOrBlocked_(last)) {
-        // Delivery failed / blocked → call process_bounced_lead(email), then close the thread.
-        if (!closed) {
-          continue;
-        }
-        const bouncedEmail = getBouncedEmail_(thread);
-        if (!bouncedEmail) {
-          console.warn('Bounce detected on thread ' + thread.getId() +
-                       ' but could not determine the bounced recipient; leaving in place.');
-          continue;
-        }
-        // RPC first (records the bounce): if it fails, leave the thread in source
-        // to retry next sweep.
-        if (!processBouncedLead_(bouncedEmail)) {
-          continue;
-        }
-        // Then push the recorded bounce(s) to ActiveCampaign via the Edge Function.
-        // Same retry philosophy: on failure, leave the thread in place so the next
-        // sweep re-runs both steps (both are idempotent).
-        if (!invokeProcessBouncedLeadsFunction_()) {
-          continue;
-        }
-        if (moveLabels_(thread, closed, source)) {
-          closedCount++;
-        }
-      } else if (isLeadReply_(last.getFrom())) {
-        // Lead replied → move to the to-action label.
-        if (transferThread_(thread, dest, source, REPLIED_STATUS)) {
-          moved++;
-        }
-      }
-    }
-
-    if (moved > 0 || closedCount > 0 || windowMinutes == null) {
-      console.log('Inspected ' + inspected + ' thread(s); moved ' + moved +
-                  ' (lead reply → "' + DEST_LABEL_TOKEN + '"), bounced ' + closedCount +
-                  ' (process_bounced_lead → "' + CLOSED_LABEL_TOKEN + '").');
+    for (let c = 0; c < CHANNELS.length; c++) {
+      processChannel_(CHANNELS[c], dest, closed, windowMinutes);
     }
   } finally {
     lock.releaseLock();
@@ -223,12 +189,96 @@ function processRepliedThreads_(windowMinutes) {
 }
 
 /**
+ * Route one channel's source label. Threads whose latest message is a lead reply
+ * move to `dest` (status → REPLIED_STATUS on the channel's threads table); threads
+ * whose latest message is a bounce/block call the channel's bounce RPC, invoke the
+ * shared Edge Function, then move to `closed`. Every Supabase side-effect runs
+ * BEFORE the label move, so a transient failure leaves the thread in the source
+ * label to retry next sweep.
+ * @param {{name:string, sourceLabel:string, threadsTable:string, bounceRpc:string}} channel
+ * @param {GmailLabel} dest
+ * @param {GmailLabel|null} closed
+ * @param {number|null} windowMinutes
+ */
+function processChannel_(channel, dest, closed, windowMinutes) {
+  const source = resolveLabel_(channel.sourceLabel, false);
+  if (!source) {
+    console.log('[' + channel.name + '] Source label not found: "' +
+                channel.sourceLabel + '". Skipping this channel.');
+    return;
+  }
+
+  // Newest-activity-first: fresh activity (a reply or a bounce) bumps its thread to the top.
+  const threads = GmailApp.search('label:' + channel.sourceLabel, 0, BATCH_SIZE);
+  if (threads.length === 0) {
+    return;
+  }
+
+  const cutoffMs = windowMinutes == null ? null : (Date.now() - windowMinutes * 60 * 1000);
+
+  let inspected = 0;
+  let moved = 0;
+  let closedCount = 0;
+  for (let i = 0; i < threads.length; i++) {
+    const thread = threads[i];
+
+    // Cheap metadata check: skip threads with no recent activity (no message fetch).
+    if (cutoffMs != null && thread.getLastMessageDate().getTime() < cutoffMs) {
+      continue;
+    }
+
+    inspected++;
+    const msgs = thread.getMessages();
+    const last = msgs[msgs.length - 1];
+
+    if (isBounceOrBlocked_(last)) {
+      // Delivery failed / blocked → call the channel's bounce RPC(email), then close the thread.
+      if (!closed) {
+        continue;
+      }
+      const bouncedEmail = getBouncedEmail_(thread);
+      if (!bouncedEmail) {
+        console.warn('[' + channel.name + '] Bounce detected on thread ' + thread.getId() +
+                     ' but could not determine the bounced recipient; leaving in place.');
+        continue;
+      }
+      // RPC first (records the bounce): if it fails, leave the thread in source
+      // to retry next sweep.
+      if (!processBouncedLead_(bouncedEmail, channel.bounceRpc)) {
+        continue;
+      }
+      // Then push the recorded bounce(s) to ActiveCampaign via the shared Edge
+      // Function. Same retry philosophy: on failure, leave the thread in place so
+      // the next sweep re-runs both steps (both are idempotent).
+      if (!invokeProcessBouncedLeadsFunction_()) {
+        continue;
+      }
+      if (moveLabels_(thread, closed, source)) {
+        closedCount++;
+      }
+    } else if (isLeadReply_(last.getFrom())) {
+      // Lead replied → move to the to-action label.
+      if (transferThread_(thread, dest, source, REPLIED_STATUS, channel.threadsTable)) {
+        moved++;
+      }
+    }
+  }
+
+  if (moved > 0 || closedCount > 0 || windowMinutes == null) {
+    console.log('[' + channel.name + '] Inspected ' + inspected + ' thread(s); moved ' +
+                moved + ' (lead reply → "' + DEST_LABEL_TOKEN + '"), bounced ' + closedCount +
+                ' (' + channel.bounceRpc + ' → "' + CLOSED_LABEL_TOKEN + '").');
+  }
+}
+
+/**
  * Update Supabase status (DB first) then relabel a thread. If the Supabase update
  * fails, the thread is left in place so it retries next sweep.
+ * @param {string} table  The channel's threads table to update (matched on thread_id).
  * @return {boolean} true if the thread was moved.
  */
-function transferThread_(thread, destLabel, sourceLabel, status) {
-  if (!updateThreadStatus_(thread.getId(), status)) {
+function transferThread_(thread, destLabel, sourceLabel, status, table) {
+  if (!updateThreadStatus_(thread.getId(), status, table)) {
     return false;
   }
   return moveLabels_(thread, destLabel, sourceLabel);
@@ -372,17 +422,19 @@ function extractEmails_(headerValue) {
 // ---------------------------------------------------------------------------
 
 /**
- * Set status = <status> and status_update_date = now (Sydney local) on the
- * follow_up_sequence_threads row whose thread_id matches the given Gmail thread id,
- * via the Supabase REST (PostgREST) API.
+ * Set status = <status> and status_update_date = now (Sydney local) on the given
+ * threads table's row whose thread_id matches the given Gmail thread id, via the
+ * Supabase REST (PostgREST) API.
  *
  * @param {string} threadId  Gmail thread id (thread.getId()).
  * @param {string} status    New status value (e.g. REPLIED_STATUS).
+ * @param {string} table     The channel's threads table (e.g. follow_up_sequence_threads
+ *                           or cold_leads_follow_up_sequence_threads).
  * @return {boolean} true on HTTP 2xx (including "no matching row" — logged as a
  *                   warning so an untracked thread doesn't block routing); false
  *                   on a missing key, non-2xx response, or thrown error.
  */
-function updateThreadStatus_(threadId, status) {
+function updateThreadStatus_(threadId, status, table) {
   const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
   if (!key) {
     console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
@@ -390,7 +442,7 @@ function updateThreadStatus_(threadId, status) {
     return false;
   }
 
-  const url = SUPABASE_URL + '/rest/v1/' + SUPABASE_TABLE +
+  const url = SUPABASE_URL + '/rest/v1/' + table +
               '?thread_id=eq.' + encodeURIComponent(threadId);
 
   // Local wall-clock stamp for the `timestamp without time zone` column, e.g. 2026-09-21T14:05:09.
@@ -437,21 +489,23 @@ function updateThreadStatus_(threadId, status) {
 }
 
 /**
- * Call the process_bounced_lead(_email_add_sent) Postgres function via the Supabase
- * PostgREST RPC endpoint, passing the bounced recipient's email.
+ * Call the given bounce Postgres function (e.g. process_bounced_lead or
+ * process_bounced_cold_lead), which takes a single _email_add_sent arg, via the
+ * Supabase PostgREST RPC endpoint, passing the bounced recipient's email.
  *
  * @param {string} email  The address that bounced.
+ * @param {string} rpc    The channel's bounce RPC name (CHANNELS[].bounceRpc).
  * @return {boolean} true on HTTP 2xx; false on a missing key, non-2xx, or thrown error.
  */
-function processBouncedLead_(email) {
+function processBouncedLead_(email, rpc) {
   const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
   if (!key) {
     console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
-                  '"; cannot call ' + BOUNCE_RPC + '. Set it in Project Settings → Script Properties.');
+                  '"; cannot call ' + rpc + '. Set it in Project Settings → Script Properties.');
     return false;
   }
 
-  const url = SUPABASE_URL + '/rest/v1/rpc/' + BOUNCE_RPC;
+  const url = SUPABASE_URL + '/rest/v1/rpc/' + rpc;
 
   const payload = {};
   payload[BOUNCE_RPC_ARG] = email;
@@ -471,14 +525,14 @@ function processBouncedLead_(email) {
     const resp = UrlFetchApp.fetch(url, options);
     const code = resp.getResponseCode();
     if (code >= 200 && code < 300) {
-      console.log('Called ' + BOUNCE_RPC + ' for bounced lead ' + email + '.');
+      console.log('Called ' + rpc + ' for bounced lead ' + email + '.');
       return true;
     }
-    console.error('Supabase RPC ' + BOUNCE_RPC + ' failed for ' + email +
+    console.error('Supabase RPC ' + rpc + ' failed for ' + email +
                   ' (HTTP ' + code + '): ' + resp.getContentText());
     return false;
   } catch (err) {
-    console.error('Supabase RPC ' + BOUNCE_RPC + ' error for ' + email + ': ' + err);
+    console.error('Supabase RPC ' + rpc + ' error for ' + email + ': ' + err);
     return false;
   }
 }
