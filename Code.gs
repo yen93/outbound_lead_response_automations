@@ -14,8 +14,10 @@
  * leaves the thread in place to retry next sweep (no silent desync). Each channel
  * uses its own threads table + bounce RPC (see CHANNELS); the dest/closed labels
  * and the bounce Edge Function are shared:
- *   - Lead reply  → set <channel.threadsTable>.status = REPLIED_STATUS on the
- *                   row matched by thread_id, and stamp status_update_date.
+ *   - Lead reply  → record the reply via the process_lead_responses RPC (into
+ *                   public.lead_responses) with the lead's email, then set
+ *                   <channel.threadsTable>.status = REPLIED_STATUS on the row
+ *                   matched by thread_id, and stamp status_update_date.
  *   - Bounce/block → call the channel's bounce RPC (process_bounced_lead for
  *                    soc-med, process_bounced_cold_lead for cold), taking
  *                    _email_add_sent, with the bounced recipient's email (bounced
@@ -105,6 +107,16 @@ const SUPABASE_URL = 'https://aivitcomiywiysrfwqxt.supabase.co';
 
 /** Status set on a thread's row once the lead has replied and it's been actioned. */
 const REPLIED_STATUS = '8A';
+
+/**
+ * RPC that RECORDS a lead reply into public.lead_responses (deal note / follow-up
+ * downstream, mirroring how bounces are recorded into bounced_leads). Unlike the
+ * per-channel bounce RPCs, this single function handles both channels: it classifies
+ * soc-med vs cold from the threads tables and pulls the ActiveCampaign ids from the
+ * AC mirror tables. Takes the same single `_email_add_sent` (BOUNCE_RPC_ARG) text arg
+ * and is idempotent (dedup by email), so it's safe to retry.
+ */
+const LEAD_RESPONSE_RPC = 'process_lead_responses';
 
 /**
  * Argument name shared by every channel's bounce RPC (each channel's function
@@ -257,6 +269,15 @@ function processChannel_(channel, dest, closed, windowMinutes) {
         closedCount++;
       }
     } else if (isLeadReply_(last.getFrom())) {
+      // Lead replied. Additional step: record the response in Supabase via the
+      // process_lead_responses RPC BEFORE the move, so a transient failure leaves
+      // the thread in the source label to retry next sweep (the RPC dedups by
+      // email, so a retry after a partial success is a no-op). The existing
+      // transferThread_ step (status → 8A + move) is unchanged.
+      const leadEmail = extractEmail_(last.getFrom());
+      if (leadEmail && !recordLeadResponse_(leadEmail)) {
+        continue;
+      }
       // Lead replied → move to the to-action label.
       if (transferThread_(thread, dest, source, REPLIED_STATUS, channel.threadsTable)) {
         moved++;
@@ -533,6 +554,56 @@ function processBouncedLead_(email, rpc) {
     return false;
   } catch (err) {
     console.error('Supabase RPC ' + rpc + ' error for ' + email + ': ' + err);
+    return false;
+  }
+}
+
+/**
+ * Record a lead reply into public.lead_responses by calling the process_lead_responses
+ * Postgres function via the Supabase PostgREST RPC endpoint, passing the lead's email.
+ * The RPC (a single cross-channel function) classifies soc-med vs cold from the threads
+ * tables, looks up the ActiveCampaign ids, and de-dups by email — so this is safe to
+ * retry. Shares the _email_add_sent arg name (BOUNCE_RPC_ARG) with the bounce RPCs.
+ *
+ * @param {string} email  The lead's reply address.
+ * @return {boolean} true on HTTP 2xx; false on a missing key, non-2xx, or thrown error.
+ */
+function recordLeadResponse_(email) {
+  const key = PropertiesService.getScriptProperties().getProperty(SUPABASE_KEY_PROPERTY);
+  if (!key) {
+    console.error('Missing Script Property "' + SUPABASE_KEY_PROPERTY +
+                  '"; cannot call ' + LEAD_RESPONSE_RPC + '. Set it in Project Settings → Script Properties.');
+    return false;
+  }
+
+  const url = SUPABASE_URL + '/rest/v1/rpc/' + LEAD_RESPONSE_RPC;
+
+  const payload = {};
+  payload[BOUNCE_RPC_ARG] = email;
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: key,
+      Authorization: 'Bearer ' + key
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const resp = UrlFetchApp.fetch(url, options);
+    const code = resp.getResponseCode();
+    if (code >= 200 && code < 300) {
+      console.log('Called ' + LEAD_RESPONSE_RPC + ' for lead reply ' + email + '.');
+      return true;
+    }
+    console.error('Supabase RPC ' + LEAD_RESPONSE_RPC + ' failed for ' + email +
+                  ' (HTTP ' + code + '): ' + resp.getContentText());
+    return false;
+  } catch (err) {
+    console.error('Supabase RPC ' + LEAD_RESPONSE_RPC + ' error for ' + email + ': ' + err);
     return false;
   }
 }

@@ -93,6 +93,10 @@ James, have James do these steps or do them while signed in to his account.
 3. Confirm the Supabase row updated: in `public.follow_up_sequence_threads`, the row whose `thread_id`
    equals that thread's id now has `status = '8A'` and a fresh `status_update_date`
    (`select thread_id, status, status_update_date from public.follow_up_sequence_threads where thread_id = '<id>';`).
+   Also confirm the reply was **recorded**: `process_lead_responses` was called with the lead's email
+   (Executions log line `Called process_lead_responses for lead reply <email>`) and a matching row now
+   exists in `public.lead_responses` (`select * from public.lead_responses where email = '<email>';`),
+   with its `source_table`/`lead_type` and the ActiveCampaign ids looked up from the AC mirror tables.
 4. **Bounce path:** send to an address that hard-fails (or forward a real postmaster/Mail Delivery
    Subsystem failure into a source-labelled thread as its latest message) → within ~1 minute confirm
    the thread moves to `follow-up-sequence-closed` and that `process_bounced_lead` was called with the
@@ -116,6 +120,7 @@ James, have James do these steps or do them while signed in to his account.
 | `CREATE_DEST_IF_MISSING` | `true` | Create the destination label if not found. |
 | `SUPABASE_URL` | `https://aivitcomiywiysrfwqxt.supabase.co` | MAGTestProject REST endpoint. |
 | `REPLIED_STATUS` | `8A` | Status set on the thread's row when the lead replies. |
+| `LEAD_RESPONSE_RPC` | `process_lead_responses` | RPC that records a lead reply into `public.lead_responses` (single cross-channel function; takes `_email_add_sent`). |
 | `BOUNCE_RPC_ARG` | `_email_add_sent` | Argument name shared by every channel's bounce RPC. |
 | `BOUNCE_EDGE_FUNCTION` | `process-bounced-leads` | Edge Function invoked after the RPC to push recorded bounces to ActiveCampaign. |
 | `STATUS_DATE_TIMEZONE` | `Australia/Sydney` | Timezone used to stamp `status_update_date`. |

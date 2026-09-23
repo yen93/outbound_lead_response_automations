@@ -46,8 +46,20 @@ sweep. For each thread it looks at the **last message**:
      ActiveCampaign. Shared by every channel.
   3. Move the thread to `follow-up-sequence-closed`.
 - **Lead reply** (external sender, not ours, not a system sender) —
-  `transferThread_()` sets `<channel.threadsTable>.status = '8A'` +
-  `status_update_date`, then moves to the to-action label.
+  `recordLeadResponse_(email)` first POSTs
+  `/rest/v1/rpc/process_lead_responses` (arg `_email_add_sent`) to RECORD the reply
+  into `public.lead_responses`, then `transferThread_()` sets
+  `<channel.threadsTable>.status = '8A'` + `status_update_date` and moves to the
+  to-action label. Like every side-effect, the record runs BEFORE the move (returns
+  a boolean; `continue` on failure) and is idempotent, so a retry is safe.
+  `process_lead_responses` is a SINGLE cross-channel RPC (unlike the per-channel
+  bounce twins): it classifies soc-med vs cold from the two threads tables
+  (`follow_up_sequence_threads` -> `'soc med'`, `cold_leads_follow_up_sequence_threads`
+  -> `'cold'`), de-dups by email, and fills `ac_contact_created` / `ac_account_created`
+  / `ac_deal_created` by looking the email up in the `activecampaign_contacts` /
+  `activecampaign_accounts` / `activecampaign_deals` mirror tables (NULL if not
+  mirrored yet). `lead_responses` mirrors `bounced_leads` minus `ac_note_datetime` /
+  `lost_deal_datetime`.
 - **Our domain last** — stays put.
 
 `process_bounced_lead` / `process_bounced_cold_lead` (RPCs, underscores) and

@@ -1,0 +1,131 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-09-23
+Session: Add a lead-response recording path — new public.lead_responses table,
+         a single cross-channel process_lead_responses RPC (classifies soc-med
+         vs cold from the threads tables, pulls ActiveCampaign ids from the AC
+         mirror tables), and an additive Code.gs step that records every lead
+         reply before the label move.
+================================================================================
+
+NOTE ON REDACTIONS: No live secrets were pasted into this session. Only the
+Script Property name SUPABASE_SERVICE_ROLE_KEY and the gitignored creds.txt are
+referenced (by name/location, never by value). Nothing needed redacting.
+
+--------------------------------------------------------------------------------
+USER:
+(Plan mode.) Pasted a three-part spec:
+- table: create lead_responses with the same columns as bounced_leads but WITHOUT
+  ac_note_datetime and lost_deal_datetime.
+- rpc: create a Supabase RPC process_lead_responses, similar to
+  process_bounced_lead / process_bounced_cold_lead but handling BOTH soc-med and
+  cold; source tables are only follow_up_sequence_threads (soc med) or
+  cold_leads_follow_up_sequence_threads (cold).
+- appscript: add an ADDITIONAL step for '8A' threads that calls the RPC passing
+  the lead's email (like the existing bounce RPC), WITHOUT altering any existing
+  step — an addition only, not an alteration.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read Code.gs in full and inspected the live schema on Supabase MAGTestProject
+(ref aivitcomiywiysrfwqxt) via MCP. Key findings:
+- bounced_leads columns: id (bigint IDENTITY ALWAYS, PK), created_at (timestamptz
+  default CURRENT_TIMESTAMP), source_table (varchar NOT NULL), email (varchar NOT
+  NULL), ac_contact_created/ac_account_created/ac_deal_created (text),
+  ac_note_datetime, lost_deal_datetime (the two to exclude), lead_type (text).
+  RLS enabled, 0 policies (service_role bypasses).
+- The two bounce RPCs each update TWO lead tables to status '10A' and insert into
+  bounced_leads (dedup on email via NOT EXISTS), tagging lead_type 'soc med' /
+  'cold'. They take a single _email_add_sent text arg.
+- The threads tables (follow_up_sequence_threads,
+  cold_leads_follow_up_sequence_threads) carry email + thread_id + status, but do
+  NOT carry the ac_* id columns.
+- Code.gs lead-reply branch calls transferThread_ -> updateThreadStatus_ (PATCH
+  status '8A') then moveLabels_. Repo convention: every Supabase side-effect runs
+  BEFORE the label move, returns a boolean, and on failure the code continues,
+  leaving the thread in the source label to retry; all side-effects idempotent.
+
+Flagged the real ambiguity: lead_responses inherits the ac_* columns from
+bounced_leads, but the threads tables (named as the RPC's source) don't contain
+them. Asked two questions. Answers: (1) populate ac_contact/account/deal from
+tables activecampaign_deals, activecampaign_accounts, activecampaign_contacts;
+(2) dedup by email.
+
+Inspected those AC mirror tables and validated the join against real rows:
+activecampaign_contacts.email -> id (contact); contacts.orgid ('0' = none) =
+account id (= activecampaign_accounts.id); activecampaign_deals.contact ->
+deal id. Confirmed no existing function encodes this mapping (nothing to reuse).
+Confirmed bounced_leads RLS (enabled, no policies) to mirror, and read the README
+config table + CLAUDE.md flow section for doc-sync targets.
+
+Wrote the plan to the plan file: (1) lead_responses = bounced_leads minus the two
+datetimes, RLS on; (2) process_lead_responses(_email_add_sent) classifies soc-med
+vs cold from the threads tables (source_table + lead_type), left-joins the AC
+tables for the ids (account = nullif(orgid,'0'), deal = latest by cdate),
+inserts guarded by NOT EXISTS, RETURNING *; (3) an additive Code.gs step
+(new LEAD_RESPONSE_RPC const + recordLeadResponse_ helper + one call in the
+lead-reply branch BEFORE the unchanged transferThread_); (4) README + CLAUDE.md
+doc sync. Included a verification section. Exited plan mode; user approved.
+
+--------------------------------------------------------------------------------
+USER:
+(Approved the plan.)
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Implemented end to end.
+
+Supabase (one migration create_lead_responses_and_rpc via MCP apply_migration):
+- Created public.lead_responses (id bigint identity PK, created_at default,
+  source_table/email varchar NOT NULL, ac_contact/account/deal text, lead_type
+  text); enabled RLS. Verified columns + RLS match the spec.
+- Created process_lead_responses(_email_add_sent text) RETURNS SETOF
+  lead_responses: a `classified` CTE (EXISTS against each threads table, soc-med
+  wins, LIMIT 1), an `ac` CTE (contact by lower(email), account = nullif(orgid,
+  '0'), deal = latest by cdate), INSERT ... SELECT left-joining ac, guarded by
+  NOT EXISTS on lower(email), RETURNING *. lower() used on all email comparisons
+  for robustness.
+Verified with real emails: mpowell@nafda.com.au -> soc med row (source_table
+follow_up_sequence_threads, ac ids 18426/2729/4072); schchristensen@agl.com.au ->
+cold row (cold_leads_follow_up_sequence_threads, 18947/2793/4195). A dedup re-run
+and an unknown-email call both inserted nothing (final table held exactly 2
+rows). Deleted the two test rows afterwards (table back to 0).
+
+Code.gs (additive only; existing steps untouched):
+- Added const LEAD_RESPONSE_RPC = 'process_lead_responses' near REPLIED_STATUS.
+- Added recordLeadResponse_(email): POSTs /rest/v1/rpc/process_lead_responses with
+  { _email_add_sent: email } (reuses BOUNCE_RPC_ARG), returns boolean on 2xx,
+  logs "Called process_lead_responses for lead reply <email>". processBouncedLead_
+  left as-is.
+- In the lead-reply branch of processChannel_, added a call to recordLeadResponse_
+  (on the extracted lead email) BEFORE the unchanged transferThread_, with the
+  same "continue on failure" retry semantics; the RPC's email-dedup makes a retry
+  after partial success a no-op. Updated the file-header comment's Lead-reply
+  bullet.
+
+Docs: README.md — added a config-table row for LEAD_RESPONSE_RPC and a verify
+step (log line + lead_responses row check). CLAUDE.md — rewrote the Lead-reply
+flow bullet to describe recordLeadResponse_ + process_lead_responses as a single
+cross-channel RPC (contrast with the per-channel bounce twins), the AC-mirror
+lookups, and that lead_responses mirrors bounced_leads minus the two datetimes.
+Corrected a signature slip (recordLeadResponse_ takes only email).
+
+Noted deployment is still manual (paste Code.gs into the Apps Script project;
+migration already applied); no new Script Property or OAuth scope needed. Did not
+commit (user had not asked).
+
+--------------------------------------------------------------------------------
+USER:
+Ran /dcp to document, commit, and push.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Timestamped and wrote this chat_history file, updated as_built.txt (new
+lead_responses table, the process_lead_responses RPC, and the Code.gs recording
+step) and CLAUDE.md (already updated during implementation). Ran the security
+gate over the session content and the files to be staged — no live secrets; only
+Script Property name/creds.txt references; creds.txt gitignored. Staged the
+legitimate changes, committed, and pushed to origin/main.
+
+================================================================================
+END OF EXPORT
+================================================================================

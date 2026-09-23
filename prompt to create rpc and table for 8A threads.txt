@@ -1,0 +1,12 @@
+## table:
+- create a table called lead_responses. 
+- columns should be the same as the bounced_leads columns but do not include ac_note_datetime and lost_deal_datetime.
+
+## rpc function:
+- create a supabase function (rpc) for lead responses called process_lead_responses
+- this function is similar to process_bounced_lead and process_bounced_cold_lead but this rpc function you will make should be able to handle both soc med and cold leads tables
+- source tables are only either: follow_up_sequence_threads (soc med) or cold_leads_follow_up_sequence_threads (cold)
+
+## appscript:
+- update appscript so that there is an additional step for '8A' threads where the rpc function is called and the email address of the lead is passed on (similar to the existing rpc for bounced leads)
+- make sure not the change any of the existing steps in appscript. this update should only be an additional step for processing '8A' threads not an alteration to the existing process.

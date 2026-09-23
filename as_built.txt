@@ -9,7 +9,8 @@ SCRIPTS
   (soc-med + cold) with identical logic; a channel row is
   { name, sourceLabel, threadsTable, bounceRpc }. For each thread it acts on the
   LATEST message:
-    * Lead reply (external sender)  -> moves to
+    * Lead reply (external sender)  -> records the reply via the shared
+      process_lead_responses RPC (into public.lead_responses), then moves to
       @-sales-to-action-outbound-lead-responses and sets the matching row in the
       channel's threads table status = '8A' + status_update_date (Sydney).
     * Delivery failed / blocked (postmaster / Mail Delivery Subsystem) -> calls
@@ -35,6 +36,7 @@ EXTERNAL INTEGRATIONS
 - Supabase MAGTestProject (https://aivitcomiywiysrfwqxt.supabase.co) — accessed
   from Code.gs via REST/PostgREST:
     * PATCH /rest/v1/<channel threads table> (lead-reply status update)
+    * POST  /rest/v1/rpc/process_lead_responses (record a lead reply)
     * POST  /rest/v1/rpc/<channel bounce RPC> (record a bounce)
     * POST  /functions/v1/process-bounced-leads (Edge Function; action bounces)
   Auth: service_role key in the Apps Script Script Property
@@ -57,6 +59,16 @@ DATA STORES (Supabase MAGTestProject)
   consumed by the process-bounced-leads Edge Function. Columns include email,
   ac_deal_created, ac_note_datetime, lost_deal_datetime, and lead_type
   ('soc med' or 'cold', tagged on new inserts; pre-existing rows are NULL).
+- public.lead_responses — one row per lead reply (created by
+  process_lead_responses on the 8A path). Clone of bounced_leads MINUS
+  ac_note_datetime + lost_deal_datetime: id, created_at, source_table, email,
+  ac_contact_created, ac_account_created, ac_deal_created, lead_type. Deduped on
+  email. RLS enabled, no policies. (Awaiting a downstream AC step, analogous to
+  process-bounced-leads for bounces.)
+- ActiveCampaign mirror tables public.activecampaign_contacts /
+  activecampaign_accounts / activecampaign_deals — read by process_lead_responses
+  to fill the ac_* ids by email (contact.id; account = contacts.orgid, '0' = none;
+  deal = latest deals row where deals.contact = contact.id).
 
 FUNCTIONS (Supabase RPCs)
 - public.process_bounced_lead(_email_add_sent text) RETURNS SETOF bounced_leads —
@@ -65,6 +77,12 @@ FUNCTIONS (Supabase RPCs)
 - public.process_bounced_cold_lead(_email_add_sent text) RETURNS SETOF
   bounced_leads — cold twin: sets status '10A' on manually_found_cold_leads +
   ai_verified_cold_leads, inserts with lead_type 'cold'.
+- public.process_lead_responses(_email_add_sent text) RETURNS SETOF
+  lead_responses — SINGLE cross-channel RPC for the 8A path (not per-channel like
+  the bounce twins). Classifies soc-med vs cold by which threads table holds the
+  email (source_table + lead_type), fills ac_contact/account/deal from the
+  activecampaign_* mirror tables, inserts a de-duplicated (on email) lead_responses
+  row. Does NOT touch thread status ('8A' is set by the Code.gs PATCH).
 
 AUTOMATIONS / ROUTINES
 - moveThreads() (Apps Script time trigger, every 1 minute) — the multi-channel
